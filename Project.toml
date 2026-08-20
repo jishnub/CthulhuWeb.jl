@@ -1,6 +1,6 @@
 name = "CthulhuWeb"
 uuid = "291b6c8b-c5f4-40ad-8fcd-4529a92dfdf3"
-authors = ["Jishnu Bhattacharya <jishnubhattacharya97@gmail.com> and contributors"]
+authors = ["Jishnu Bhattacharya <jishnub.github@gmail.com> and contributors"]
 version = "0.1.0"
 
 [deps]
