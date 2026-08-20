@@ -23,6 +23,15 @@ shim(x, n=2) = x^n + length(string(x))
 # keyword shim whose default value is itself a call, like sqrt_quasitriu's
 kwshim(v; width = eltype(v) <: Complex ? 512 : 256) = length(v) + width
 
+# bindings of several shapes, all of which must carry their own annotation
+function annotated(x)
+    n = length(string(x))
+    T = x > 0 ? Int64 : Float64
+    Tr = typeof(sqrt(zero(Float64)))
+    y = rand(T)
+    return (n, T, Tr, y)
+end
+
 # a composite expression evaluating to a Type, inside an unstable expression
 function constdemo(x)
     T = x > 0 ? Int64 : Float64
@@ -397,6 +406,64 @@ end
     @test all(h -> occursin("Float64", h.captures[1]), hits)
     @test !any(h -> occursin("Union{", h.captures[1]), hits)   # not the ancestor's
     println("  Tr annotated as: ", unique(h.captures[1] for h in hits))
+end
+
+@testset "every typed binding carries its own annotation" begin
+    # The invariant behind three separate reported bugs: an expression with no
+    # span of its own inherits its ancestors' colour AND reports their type on
+    # hover. Any future suppression rule must not strip a binding's annotation.
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    ami = find_method_instance(provider, annotated, Tuple{Float64})
+    s = Session(provider, ami; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+
+    span_for(v) = collect(eachmatch(
+        Regex("<span class=\"[^\"]*\"(?: data-type=\"([^\"]*)\")?[^>]*>" * v * "</span>"),
+        html))
+
+    for (v, expect) in ("n" => "Int64", "T" => "Type", "Tr" => "Float64", "y" => "Float64")
+        hits = span_for(v)
+        @test !isempty(hits)                                   # has a span
+        @test all(h -> h.captures[1] !== nothing, hits)         # carrying a type
+        @test any(h -> occursin(expect, h.captures[1]), hits)   # a plausible one
+        println("  ", rpad(v, 3), " -> ", unique(h.captures[1] for h in hits))
+    end
+end
+
+@testset "presentation mechanisms that silently regressed before" begin
+    css = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "style.css"), String)
+    js  = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "app.js"), String)
+
+    # Tooltips were once a CSS ::after using `:hover:not(:has(...))`. That is
+    # clipped by .srcwrap's scroll container (invisible on line 1) and the whole
+    # rule is dropped by browsers without :has(). Must stay JS-driven.
+    # no ::after tooltip hung off a type span (:has elsewhere is fine)
+    @test !occursin(r"\[data-type\][^{]*::after", css)
+    @test occursin("#tip", css)
+    @test occursin("position: fixed", css)
+    @test occursin("closest(\".s[data-type]\")", js)
+
+    # `color: inherit` directly on a type class is what let a warning colour leak
+    # into nested stable expressions. (Descendant rules like
+    # `.s-union .tok-pun { color: inherit }` are deliberate and excluded.)
+    for m in eachmatch(r"(?m)^\.s-(stable|union|unstable)\s*\{([^}]*)\}", css)
+        @test !occursin("color: inherit", m.captures[2])
+    end
+
+    # Syntax tokens must not resolve a tooltip from a distant typed ancestor:
+    # hovering the `=` in `Tr = typeof(...)` reported the function's return type,
+    # because the assignment statement has no span of its own.
+    @test occursin(".tok-op, .tok-pun, .tok-kw, .tok-com", js)
+    i = findfirst("onmousemove", js)
+    @test i !== nothing
+    window = js[first(i):min(end, first(i) + 300)]
+    @test occursin("SYNTAX", window)                 # checked before resolving
+    @test findfirst("SYNTAX", window)[1] < findfirst("closest(\".s[data-type]\")", window)[1]
+
+    # Busy state must be raised on send, not on the server's ack: the first ack
+    # can be seconds late, which is exactly when feedback matters.
+    @test occursin(r"refreshBusy\(\);\s*\n\s*return p;", js)
 end
 
 @testset "syntax highlighting" begin

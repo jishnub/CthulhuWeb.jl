@@ -342,7 +342,14 @@ function wireTooltips() {
     document.body.appendChild(tipEl);
   }
   const pane = $("#code");
+  // Lexical tokens are syntax, not expressions: `=`, `?`, parens, keywords and
+  // comments have no type of their own. Without this they resolve to whatever
+  // typed ancestor happens to enclose them -- for a statement with no span of
+  // its own that is the whole function, so hovering `=` reported the function's
+  // return type. Hover the name or the expression instead.
+  const SYNTAX = ".tok-op, .tok-pun, .tok-kw, .tok-com";
   pane.onmousemove = (e) => {
+    if (e.target.closest && e.target.closest(SYNTAX)) return hideTip();
     const el = e.target.closest ? e.target.closest(".s[data-type]") : null;
     if (!el) return hideTip();
     if (el !== hotEl) {
