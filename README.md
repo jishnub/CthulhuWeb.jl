@@ -109,6 +109,31 @@ Things that were verified against the source and cost real debugging time:
 - **One compiler worker.** `CthulhuInterpreter` holds five unsynchronised
   `IdDict`s mutated during inference; `process_info` can `@eval Main`.
 
+### Correctness principle: never invent a type
+
+Every annotation bug found in this view had the same shape — a construct with no
+type of its own inheriting one from a distant ancestor, because it was invisible
+in the DOM. A stable call rendered amber inside an unstable expression; hovering
+`=` reported the enclosing function's return type.
+
+So untyped **composite** nodes emit an explicit `.s-opaque` barrier span, which
+stops both the tooltip search and colour inheritance. If the analysis said
+nothing about a construct, the UI says nothing about it.
+
+Untyped **leaves** are deliberately not barriers: the callee name in
+`checksquare(A0)` is part of the surrounding expression, so reporting that
+expression's type when hovering it is accurate rather than a guess — and it is
+the most natural thing to point at. The line is between *the expression you are
+pointing at* and *some unrelated ancestor*, not between typed and untyped.
+
+Two corollaries worth keeping in mind when extending this:
+
+- Anything that suppresses an annotation must be justified by **position** (is
+  this a callee?) rather than by the value's type — otherwise it silently strips
+  real information and reopens the inheritance hole.
+- `return expr` genuinely has `expr`'s type, so reporting it there is correct.
+  The principle forbids guessing, not reporting.
+
 ### The source view
 
 `:source` is rendered as real markup, not converted ANSI. The key fact is that

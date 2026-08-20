@@ -321,7 +321,21 @@ function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
         end
     end
 
-    (typ === nothing && nodeid == 0 && !runtime) && return false
+    if typ === nothing && nodeid == 0 && !runtime
+        # Correctness principle: never attribute a type (or a warning colour) to
+        # something that does not have one. An untyped node is otherwise invisible
+        # in the DOM, so the pointer and the CSS cascade fall through to whatever
+        # distant ancestor happens to be typed -- which is how `=` reported the
+        # enclosing function's return type and how stable calls rendered amber.
+        #
+        # Only COMPOSITE untyped nodes are barriers. An untyped leaf (the callee
+        # name in `checksquare(A0)`) is part of the surrounding expression, so
+        # reporting that expression's type for it is accurate, not a guess.
+        # Barriering leaves too would silence the most natural hover target.
+        is_leaf(node) && return false
+        print(io, "<span class=\"s-opaque\">")
+        return true
+    end
 
     classes = ["s"]
     issparam && push!(classes, "s-sparam")

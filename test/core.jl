@@ -431,6 +431,50 @@ end
     end
 end
 
+@testset "no type is reported where none is known" begin
+    # Correctness principle: never attribute a type to something that has none.
+    # Untyped COMPOSITE nodes emit an `.s-opaque` barrier that stops both the
+    # tooltip search and colour inheritance; untyped LEAVES do not, because a
+    # callee name is part of the surrounding expression and reporting that
+    # expression's type for it is accurate rather than a guess.
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    ami = find_method_instance(provider, annotated, Tuple{Float64})
+    s = Session(provider, ami; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    plain = replace(html, r"^.*?<pre class=\"code src\">"s=>"", r"</pre></div>.*$"s=>"")
+    @test occursin("s-opaque", plain)
+
+    "what a browser would show when hovering the given token"
+    function tip_at(needle)
+        stack = []
+        for m in eachmatch(r"<span class=\"([^\"]*)\"(?: data-type=\"([^\"]*)\")?[^>]*>|</span>|[^<]+", plain)
+            t = m.match
+            if startswith(t, "<span"); push!(stack, (m.captures[1], m.captures[2]))
+            elseif startswith(t, "</"); isempty(stack) || pop!(stack)
+            elseif strip(t) == needle
+                j = findlast(x -> x[2] !== nothing || occursin("s-opaque", x[1]), stack)
+                return j === nothing ? nothing :
+                       (stack[j][2] === nothing ? nothing : stack[j][2])
+            end
+        end
+        :notfound
+    end
+
+    # An assignment statement has no type of its own, so `=` reports nothing.
+    # (`return` is NOT in this list: `return expr` really does have expr's type,
+    # so reporting it there is accurate rather than a guess.)
+    @test tip_at("=") === nothing
+    # ...while names and variables resolve to the expression they belong to
+    @test tip_at("n") !== nothing && occursin("Int64", tip_at("n"))
+    @test tip_at("typeof") !== nothing && occursin("Float64", tip_at("typeof"))
+    @test tip_at("length") !== nothing
+    # the reported bug: `=` must not fall through to the function's return type
+    fnty = match(r"<span class=\"[^\"]*\" data-type=\"([^\"]*)\"", plain).captures[1]
+    @test tip_at("=") != fnty
+    println("  = -> ", tip_at("="), " ; n -> ", tip_at("n"),
+            " ; typeof -> ", tip_at("typeof"))
+end
+
 @testset "presentation mechanisms that silently regressed before" begin
     css = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "style.css"), String)
     js  = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "app.js"), String)
@@ -451,15 +495,11 @@ end
         @test !occursin("color: inherit", m.captures[2])
     end
 
-    # Syntax tokens must not resolve a tooltip from a distant typed ancestor:
-    # hovering the `=` in `Tr = typeof(...)` reported the function's return type,
-    # because the assignment statement has no span of its own.
-    @test occursin(".tok-op, .tok-pun, .tok-kw, .tok-com", js)
-    i = findfirst("onmousemove", js)
-    @test i !== nothing
-    window = js[first(i):min(end, first(i) + 300)]
-    @test occursin("SYNTAX", window)                 # checked before resolving
-    @test findfirst("SYNTAX", window)[1] < findfirst("closest(\".s[data-type]\")", window)[1]
+    # The tooltip search must stop at `.s-opaque` barriers rather than walking to
+    # any typed ancestor, and must not report a span that carries no type.
+    @test occursin("closest(\".s[data-type], .s-opaque\")", js)
+    @test occursin("dataset.type", js)
+    @test occursin(".s-opaque", css)
 
     # Busy state must be raised on send, not on the server's ack: the first ack
     # can be seconds late, which is exactly when feedback matters.

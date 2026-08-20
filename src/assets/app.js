@@ -342,15 +342,14 @@ function wireTooltips() {
     document.body.appendChild(tipEl);
   }
   const pane = $("#code");
-  // Lexical tokens are syntax, not expressions: `=`, `?`, parens, keywords and
-  // comments have no type of their own. Without this they resolve to whatever
-  // typed ancestor happens to enclose them -- for a statement with no span of
-  // its own that is the whole function, so hovering `=` reported the function's
-  // return type. Hover the name or the expression instead.
-  const SYNTAX = ".tok-op, .tok-pun, .tok-kw, .tok-com";
+  // Show a type only when the tightest enclosing annotated span really covers
+  // what the pointer is on. `.s-opaque` marks a node the analysis said nothing
+  // about, and stops the search: better to show nothing than to report an
+  // unrelated ancestor's type. This is what makes hovering `=` silent while
+  // hovering inside `sin(y)` still reports the call's type.
   pane.onmousemove = (e) => {
-    if (e.target.closest && e.target.closest(SYNTAX)) return hideTip();
-    const el = e.target.closest ? e.target.closest(".s[data-type]") : null;
+    const hit = e.target.closest ? e.target.closest(".s[data-type], .s-opaque") : null;
+    const el = hit && hit.dataset && hit.dataset.type ? hit : null;
     if (!el) return hideTip();
     if (el !== hotEl) {
       hotEl && hotEl.classList.remove("hot");

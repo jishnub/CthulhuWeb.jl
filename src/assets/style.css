@@ -268,3 +268,9 @@ body.busy .caret:not(.leaf) { cursor: progress; }
   padding: 1px 7px; margin-left: 2px; cursor: pointer;
 }
 .bodylink:hover { background: var(--sel); border-color: var(--accent); }
+
+/* A node the analysis said nothing about. Resets colour for the same reason it
+   blocks the tooltip search: an untyped construct must not inherit a warning
+   colour from a distant typed ancestor. No other styling -- it exists to be a
+   boundary. */
+.s-opaque { color: var(--fg); font-weight: 400; }
