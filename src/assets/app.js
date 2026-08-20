@@ -319,6 +319,9 @@ function wireSourceSpans() {
       select(id);
     };
   }
+  // Only when there is real annotated source to explain -- a truncated shim page
+  // has nothing but the body-method button.
+  if (!document.querySelector("#code .s-call[data-node-id]:not(.bodylink)")) return;
   const legend = document.createElement("p");
   legend.className = "srclegend";
   legend.innerHTML = "Hover any expression (or a <b>where</b> parameter) for its type · " +

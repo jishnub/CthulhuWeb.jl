@@ -15,6 +15,14 @@ rec(n) = n <= 1 ? 1 : n * rec(n - 1)
 struct TPBox{A,B}; a::A; b::B; end
 tp_combine(p::TPBox{A,B}, q::A) where {A,B} = (p.a, q)
 
+# A genuine default-argument method: Julia generates a `shim(x)` whose body is
+# empty (it only forwards), which is what triggers the truncated source view.
+# NB `shim(x) = shim(x, 2)` would NOT do -- that body is a real call expression.
+shim(x, n=2) = x^n + length(string(x))
+
+# a stable call nested inside an unstable expression
+leaky(x) = (T = x > 0 ? Int64 : Float64; rand(T) + length(string(x)))
+
 function syndemo(x)
     # pick a type based on the sign
     T = x > 0 ? Int64 : Float64
@@ -241,6 +249,61 @@ end
     smi = find_method_instance(provider, srcdemo, Tuple{Float64})
     @test isempty(static_params(smi))
     @test !occursin("class=\"sparams\"", source_html(s, Session(provider, smi; config=cfg).nodes[ROOT_ID], cfg))
+end
+
+@testset "no colour leak from nested spans" begin
+    # A type-stable call nested inside an unstable expression must not LOOK
+    # unstable. Reported case: `checksquare(A)::Int` rendering amber because its
+    # enclosing expression was a Union, so it inherited the warning colour.
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    smi = find_method_instance(provider, leaky, Tuple{Float64})
+    s = Session(provider, smi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+
+    # the scenario must actually occur, or this test proves nothing
+    stack = String[]; nested = 0
+    for m in eachmatch(r"<span class=\"([^\"]*)\"[^>]*>|</span>", html)
+        if startswith(m.match, "</")
+            isempty(stack) || pop!(stack); continue
+        end
+        cls = m.captures[1]
+        if occursin("s-stable", cls) &&
+           any(c -> occursin("s-union", c) || occursin("s-unstable", c), stack)
+            nested += 1
+        end
+        push!(stack, cls)
+    end
+    println("stable spans nested inside a warning span: ", nested)
+    @test nested > 0
+
+    css = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "style.css"), String)
+    # the base class must set an explicit colour so nothing inherits a warning one
+    @test occursin(r"\.s\s*\{[^}]*color:\s*var\(--fg\)", css)
+    # and stable spans must never be handed `color: inherit`, which would undo it
+    @test !occursin(r"\.s-stable\s*\{[^}]*color:\s*inherit", css)
+end
+
+@testset "default-argument shim links its body method" begin
+    # A method that only fills in default arguments has a single forwarding call
+    # as its body, so there is nothing in its source to click. The body method is
+    # in the tree, so the note must link it -- otherwise the pane is a dead end.
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    smi = find_method_instance(provider, shim, Tuple{Float64})
+    s = Session(provider, smi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+    @test occursin("only fills in default arguments", html)
+
+    ids = [parse(Int, m.captures[1]) for m in eachmatch(r"data-node-id=\"(\d+)\"", html)]
+    @test !isempty(ids)                          # something to click
+    @test occursin("bodylink", html)
+    kids = expand!(s, ROOT_ID; optimize=false)
+    @test all(in(kids), ids)                     # and it is a real child
+    target = s.nodes[first(ids)]
+    @test target.descendable
+    @test target.mi !== s.nodes[ROOT_ID].mi      # the body method, not itself
+    println("shim links -> ", target.mi)
 end
 
 @testset "syntax highlighting" begin

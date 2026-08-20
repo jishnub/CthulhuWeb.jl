@@ -128,12 +128,22 @@ pre.code.src { margin: 0; flex: 1; }
 
 /* Every typed sub-expression is a span. Only the type-carrying ones get colour,
    so the source still reads as source. */
+/* Every type span resets colour and weight FIRST, so a nested expression never
+   inherits its parent's warning colour. Without this a type-stable call such as
+   `checksquare(A)::Int` renders amber purely because it sits inside an unstable
+   expression -- a false instability signal, which is the one thing this view
+   must not produce. The warning rules below override for the spans that have
+   earned it (equal specificity, later wins). */
+.s { color: var(--fg); font-weight: 400; }
+
 .s-unstable { color: var(--red); font-weight: 600; }
 .s-union    { color: var(--yellow); font-weight: 600; }
 .s-runtime  { text-decoration: underline wavy var(--red) 1px; }
-body.hide-stable .s-stable { color: inherit; }
+/* de-emphasise stable code rather than recolouring it: `color: inherit` here
+   would reintroduce the leak the `.s` rule above exists to prevent. */
+body.hide-stable .s-stable { opacity: .55; }
 body:not(.show-warn) .s-unstable,
-body:not(.show-warn) .s-union { color: inherit; font-weight: inherit; }
+body:not(.show-warn) .s-union { color: var(--fg); font-weight: 400; }
 
 /* Calls are click targets. Hovering the innermost one highlights just it. */
 .s-call { cursor: pointer; border-radius: 2px; }
@@ -162,7 +172,7 @@ body:not(.show-warn) .s-union { color: inherit; font-weight: inherit; }
 /* static parameters: `where T = Float64` */
 .sparams { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
 .sparams b { color: var(--cyan); font-weight: 600; }
-.s-sparam { color: var(--cyan); }
+.s.s-sparam { color: var(--cyan); }
 
 .srclegend { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
 .srclegend b { font-weight: 600; }
@@ -248,3 +258,13 @@ body.no-syntax .tok-pun { color: inherit; font-weight: inherit; font-style: norm
 #tree { opacity: 1; transition: opacity .1s 0s; }
 body.busy #tree { opacity: .75; transition: opacity .1s .3s; }
 body.busy .caret:not(.leaf) { cursor: progress; }
+
+/* Link to the body method of a default-argument / keyword shim, whose own source
+   is a single forwarding call and therefore has nothing clickable in it. */
+.bodylink {
+  font: inherit; font-size: 12px;
+  background: var(--panel); color: var(--accent);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 7px; margin-left: 2px; cursor: pointer;
+}
+.bodylink:hover { background: var(--sel); border-color: var(--accent); }

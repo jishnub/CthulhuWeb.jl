@@ -115,6 +115,28 @@ function emit_code(io::IO, src, a::Int, b::Int, cm, offset::Int)
 end
 
 """
+Note shown for a method that only fills in default arguments (or forwards keyword
+arguments): its body is a single call to the real implementation, so there is no
+source to annotate and nothing to click. Link the body method explicitly --
+otherwise the pane is a dead end even though the tree does hold the child.
+"""
+function truncated_note(s::Session, kids::Vector{Int})
+    targets = [k for k in kids if s.nodes[k].descendable]
+    if isempty(targets)
+        return "<p class=\"note\">This method only fills in default arguments; " *
+               "descend into the body method to see the full source.</p>"
+    end
+    links = join(map(targets) do k
+        l = s.nodes[k].label
+        sig = l.name * "(" * join(["::" * a for a in l.argtypes], ", ") * ")"
+        "<button class=\"s-call bodylink\" data-node-id=\"$(k)\">" *
+        html_escape(sig) * "</button>"
+    end, " ")
+    return "<p class=\"note\">This method only fills in default arguments. " *
+           "Descend into the body method: " * links * "</p>"
+end
+
+"""
     source_html(session, node, cfg) -> String
 
 Render the node's source with nested `<span>`s carrying inferred types, and
@@ -137,6 +159,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     # Map source spans -> child node ids by position.
     callsite_map = Dict{Tuple{Int,Int},Int}()
+    kids = Int[]
     try
         callsites, sourcenodes = find_callsites(s.provider, result, node.ci, true)
         kids = expand!(s, node.id; optimize=false)
@@ -180,8 +203,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     file = node.label.file === nothing ? "" :
         "<div class=\"srcfile\">" * html_escape(node.label.file) * "</div>"
-    note = truncated ? "<p class=\"note\">This method only fills in default " *
-        "arguments; descend into the body method to see the full source.</p>" : ""
+    note = truncated ? truncated_note(s, kids) : ""
 
     sp = isempty(sparams) ? "" :
         "<div class=\"sparams\">where " *

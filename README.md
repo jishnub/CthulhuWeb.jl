@@ -143,6 +143,19 @@ innermost span makes browsers without `:has()` drop the entire rule. A single
 `position: fixed` element driven by `mouseover` has neither problem, and
 `e.target.closest(".s[data-type]")` picks the innermost span for free.
 
+**No colour leak between nested spans.** Type spans nest, and CSS colour
+inherits, so a type-stable call sitting inside an unstable expression would
+render amber purely by inheritance — `checksquare(A)::Int` looking unstable
+because its enclosing expression was a `Union`. The base `.s` class therefore
+resets colour and weight explicitly, and only the spans that earned a warning
+override it. A false instability signal is the one thing this view must not
+produce.
+
+**Default-argument and keyword shims link their body method.** Such a method's
+body is a single forwarding call, so there is no source to annotate and nothing
+to click; the note carries a button to the body method, which is already a child
+in the tree.
+
 Two more things worth knowing if you extend it:
 
 - **Do not route this through `cthulhu_typed`.** `CthulhuConfig` hard-ANDs the
