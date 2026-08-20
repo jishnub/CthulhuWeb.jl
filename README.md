@@ -178,6 +178,23 @@ The syntax palette is defined as its own set of CSS variables, disjoint from the
 type palette, so lexical colour can never be mistaken for a type signal. A
 **syntax** checkbox turns it off client-side.
 
+### Startup is non-blocking
+
+`descend_web` starts the HTTP server **before** analysing the entry point, and
+builds the session on a background task. Constructing it runs full type
+inference, which for something like `sqrt(::Matrix{Float64})` takes seconds;
+doing that first meant the REPL appeared to hang, Ctrl-C could not help (the work
+is on a worker task, not the main one), and the browser got connection-refused
+for the whole duration.
+
+Now the page is up immediately and the client is told `initializing` until the
+root is ready. Measured on `sqrt(::Matrix{Float64})`: `descend_web` returns in
+~1 s, `initializing` reaches the browser at +0.07 s, `init` at +5.7 s.
+
+One consequence worth knowing: inference runs on a single worker, so issuing a
+second `@descend_web` while a slow one is still analysing queues behind it rather
+than running in parallel.
+
 ### Progress feedback
 
 Inference runs server-side with no incremental progress to report, so the UI

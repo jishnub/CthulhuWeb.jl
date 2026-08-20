@@ -39,7 +39,20 @@ function send(op, extra = {}) {
 
 function onMessage(msg) {
   if (msg.op === "ack") { refreshBusy(); return; }
+  if (msg.op === "initializing") {
+    // Server is up but the entry point is still being inferred. Say so instead
+    // of showing an empty tree.
+    $("#root-sig").textContent = "analysing…";
+    document.body.classList.add("busy");
+    showLoading("Analysing the entry point…");
+    $("#tree").innerHTML = `<li class="node"><div class="row">` +
+      `<span class="caret"><span class="spinner"></span></span>` +
+      `<span class="label note">waiting for type inference…</span></div></li>`;
+    return;
+  }
   if (msg.op === "init") {
+    clearLoading();
+    document.body.classList.remove("busy");
     nodes.set(msg.root.id, msg.root);
     $("#root-sig").textContent = msg.root.name;
     applyConfig(msg.config);

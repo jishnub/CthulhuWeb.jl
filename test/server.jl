@@ -171,6 +171,34 @@ try
         @test_throws Exception HTTP.get("http://localhost:8766/"; retry=false)
     end
 
+    @testset "serves before analysing" begin
+        # Regression: the session used to be built before `HTTP.listen!`, so a
+        # slow entry point (LinearAlgebra, big generic calls) made descend_web
+        # block, Ctrl-C useless, and the browser get connection-refused for the
+        # whole analysis.
+        slowtarget(A) = sqrt(A * A')
+        descend_web(slowtarget, Tuple{Matrix{Float64}}; port=8793)
+        try
+            # reachable straight away, i.e. before analysis can have finished
+            @test HTTP.get("http://localhost:8793/"; retry=false).status == 200
+
+            ops = String[]
+            HTTP.WebSockets.open("ws://localhost:8793/") do ws
+                for raw in ws
+                    m = JSON3.read(raw)
+                    push!(ops, String(get(m, :op, "")))
+                    last(ops) in ("init", "error") && break
+                end
+            end
+            println("  handshake ops: ", ops)
+            @test last(ops) == "init"
+            # every op before `init` must be the initializing notice
+            @test all(==("initializing"), ops[1:end-1])
+        finally
+            stop_web(8793)
+        end
+    end
+
     @testset "progress feedback" begin
         # The UI shows a spinner from the moment it sends, but the server should
         # still ack promptly and before the result, so a slow inference never

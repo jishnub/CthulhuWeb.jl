@@ -202,8 +202,25 @@ function descend_web(@nospecialize(args...); port::Union{Nothing,Int} = nothing,
                      open_browser::Bool = false, kwargs...)
     mi = _resolve_mi(provider, args...)
     cfg = headless_config(CONFIG; kwargs...)
-    session = on_worker(() -> Session(provider, mi; config = cfg))
-    session isa Session || error("failed to start session: $session")
+    port = pick_port(port)
+    haskey(SERVERS, port) && stop_web(port)
+
+    # Build the session in the BACKGROUND and bring the server up first.
+    # Constructing it runs full type inference on the entry point, which for
+    # something like `sqrt(::Matrix{Float64})` can take a long time. Doing it
+    # before listening meant the REPL appeared to hang, Ctrl-C could not help
+    # (the work is on a worker task), and the browser got connection-refused for
+    # the whole duration.
+    session_task = Threads.@spawn begin
+        try
+            res = on_worker(() -> Session(provider, mi; config = cfg))
+            res isa Session || error("failed to start session: $res")
+            res
+        catch err
+            @error "CthulhuWeb: could not analyse $mi" exception=(err, catch_backtrace())
+            rethrow()
+        end
+    end
 
     # HTTP.listen! (not serve!) is the STREAM-level entry point; serve! would hand the
     # handler a Request, and WebSockets.upgrade needs a Stream. One handler serves
@@ -213,7 +230,7 @@ function descend_web(@nospecialize(args...); port::Union{Nothing,Int} = nothing,
         req = stream.message
         if HTTP.WebSockets.isupgrade(req)
             return HTTP.WebSockets.upgrade(stream) do ws
-                serve_ws(ws, session)
+                serve_ws(ws, session_task)
             end
         end
         resp = static_handler(req)
@@ -226,8 +243,6 @@ function descend_web(@nospecialize(args...); port::Union{Nothing,Int} = nothing,
         return nothing
     end
 
-    port = pick_port(port)
-    haskey(SERVERS, port) && stop_web(port)
     server = try
         HTTP.listen!(apphandler, "127.0.0.1", port)
     catch err
@@ -254,7 +269,7 @@ function _resolve_mi(provider, @nospecialize(args...))
     return mi
 end
 
-function serve_ws(ws, session::Session)
+function serve_ws(ws, session_task::Task)
     # HTTP.WebSockets sockets are not safe for concurrent writes: give the
     # connection a single writer draining an outbox.
     outbox = Channel{String}(64)
@@ -265,6 +280,20 @@ function serve_ws(ws, session::Session)
     catch
     end
     try
+        # The page is reachable before analysis finishes; say so rather than
+        # leaving the browser staring at an empty tree.
+        istaskdone(session_task) ||
+            put!(outbox, JSON3.write(Dict{String,Any}("op" => "initializing")))
+
+        session = try
+            fetch(session_task)
+        catch err
+            e = err isa TaskFailedException ? err.task.exception : err
+            isopen(outbox) && put!(outbox, JSON3.write(Dict{String,Any}(
+                "op" => "error", "msg" => sprint(showerror, e))))
+            return
+        end
+
         # seed the client
         put!(outbox, JSON3.write(Dict{String,Any}(
             "op" => "init",
@@ -284,7 +313,12 @@ function serve_ws(ws, session::Session)
             @async begin
                 out = on_worker(() -> handle(session, msg))
                 out isa AbstractDict && req !== nothing && (out = merge(out, Dict("req"=>req)))
-                isopen(outbox) && put!(outbox, JSON3.write(out))
+                # The viewer may have closed the tab while this was computing;
+                # `isopen` alone races with the writer shutting down.
+                try
+                    isopen(outbox) && put!(outbox, JSON3.write(out))
+                catch
+                end
             end
         end
     catch err
