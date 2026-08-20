@@ -1,0 +1,226 @@
+/* Cthulhu web UI. ANSI colours are CSS classes (see render.jl SGR_CLASS) so the
+   palette can follow the light/dark theme instead of being baked into escapes. */
+
+:root {
+  --bg: #ffffff;  --fg: #1b1f23;   --muted: #6a737d;  --line: #e1e4e8;
+  --panel: #f6f8fa; --accent: #0366d6; --sel: #ddf4ff;
+  --red: #b31d28; --green: #22863a; --yellow: #b08800; --blue: #032f62;
+  --magenta: #6f42c1; --cyan: #1b7c83; --gray: #6a737d; --black: #24292e;
+  --white: #6a737d;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  /* Syntax palette, deliberately disjoint from the TYPE palette (red/amber/cyan)
+     so lexical colour can never be mistaken for a type signal. */
+  --syn-kw: #8250df; --syn-com: #6e7781; --syn-str: #0a7f5f; --syn-num: #bc4c00;
+  --syn-mac: #0550ae; --syn-op: #57606a; --syn-pun: #8c959f;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1117; --fg: #c9d1d9; --muted: #8b949e; --line: #30363d;
+    --panel: #161b22; --accent: #58a6ff; --sel: #1f3a5f;
+    --red: #ff7b72; --green: #7ee787; --yellow: #d29922; --blue: #79c0ff;
+    --magenta: #d2a8ff; --cyan: #56d4dd; --gray: #8b949e; --black: #c9d1d9;
+    --white: #f0f6fc;
+    --syn-kw: #d2a8ff; --syn-com: #8b949e; --syn-str: #7ee787; --syn-num: #ffa657;
+    --syn-mac: #79c0ff; --syn-op: #a5adba; --syn-pun: #7d8590;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 13px/1.5 var(--mono);
+  display: flex; flex-direction: column;
+}
+
+header {
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header h1 { font-size: 14px; margin: 0; letter-spacing: .08em; text-transform: uppercase; }
+.sig { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spacer { flex: 1; }
+.status { color: var(--accent); min-width: 90px; text-align: right; }
+
+#toolbar {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  padding: 8px 14px; border-bottom: 1px solid var(--line);
+}
+fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px 6px; margin: 0; }
+legend { color: var(--muted); font-size: 11px; padding: 0 4px; }
+.hint { opacity: .7; font-style: italic; }
+#toolbar label { margin-right: 10px; white-space: nowrap; cursor: pointer; }
+#toolbar input[disabled] + * , #toolbar label:has(input[disabled]) { opacity: .45; }
+
+main { flex: 1; display: flex; min-height: 0; }
+#tree-pane, #code-pane { overflow: auto; min-width: 0; }
+#tree-pane { flex: 1 1 55%; border-right: 1px solid var(--line); }
+#code-pane { flex: 1 1 45%; }
+.pane-title {
+  position: sticky; top: 0; z-index: 1;
+  padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--line);
+  color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ---- tree ---- */
+.tree, .children { list-style: none; margin: 0; padding: 0; }
+.children { margin-left: 15px; border-left: 1px dotted var(--line); }
+.tree { padding: 6px 10px 40px; }
+.row { display: flex; align-items: baseline; gap: 6px; padding: 1px 4px; border-radius: 4px; white-space: nowrap; }
+.row:hover { background: var(--panel); }
+.row.selected { background: var(--sel); }
+.caret { width: 12px; cursor: pointer; color: var(--muted); user-select: none; flex: none; }
+.caret.open { transform: rotate(90deg); display: inline-block; }
+.caret.leaf { cursor: default; opacity: .35; }
+.label { cursor: pointer; }
+.loc { margin-left: auto; padding-left: 14px; color: var(--muted); font-size: 11px; opacity: .75; }
+
+.ssa    { color: var(--muted); }
+.fname  { font-weight: 600; }
+.args   { color: var(--muted); }
+.rt     { color: var(--cyan); }
+.wrap, .kind {
+  font-size: 10px; padding: 0 4px; border-radius: 3px;
+  border: 1px solid var(--line); color: var(--muted); text-transform: uppercase;
+}
+.k-multi     { color: var(--magenta); border-color: var(--magenta); }
+.k-runtime   { color: var(--red);     border-color: var(--red); }
+.k-constprop, .k-semiconcrete, .k-concrete { color: var(--green); border-color: var(--green); }
+.alt { color: var(--magenta); font-size: 11px; }
+.rec { color: var(--yellow); font-size: 11px; }
+.node.inert > .row .fname { opacity: .6; font-weight: 400; }
+
+/* Display toggles -- all client-side, no server round-trip. */
+.head, .effects, .exct { display: none; }
+body.show-head    .head    { display: inline; color: var(--muted); font-size: 11px; }
+body.show-effects .effects { display: inline; color: var(--green); font-size: 11px; }
+body.show-exct    .exct    { display: inline; color: var(--yellow); font-size: 11px; }
+
+body.show-warn .node.unstable > .row > .label > .rt { color: var(--red); font-weight: 700; }
+body.show-warn .node.expected-union > .row > .label > .rt { color: var(--yellow); font-weight: 700; }
+body.hide-stable .node:not(.unstable):not(.is-recursive) > .row { opacity: .45; }
+
+/* ---- code pane ---- */
+#code { padding: 10px 12px 40px; }
+pre.code { margin: 0; white-space: pre; overflow-x: auto; tab-size: 4; }
+.note { color: var(--muted); }
+.err  { color: var(--red); white-space: pre-wrap; }
+
+/* ANSI SGR classes emitted by ansi_to_html */
+.c-black { color: var(--black); }   .c-red { color: var(--red); }
+.c-green { color: var(--green); }   .c-yellow { color: var(--yellow); }
+.c-blue { color: var(--blue); }     .c-magenta { color: var(--magenta); }
+.c-cyan { color: var(--cyan); }     .c-white { color: var(--white); }
+.c-gray { color: var(--gray); }     .c-bold { font-weight: 700; }
+
+#splitter { width: 1px; background: var(--line); }
+
+/* ---- type-annotated source view ---- */
+.srcfile { color: var(--muted); font-size: 11px; margin-bottom: 6px;
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
+.srcwrap { display: flex; gap: 10px; overflow-x: auto; }
+pre.gutter {
+  margin: 0; text-align: right; color: var(--muted); opacity: .55;
+  user-select: none; flex: none; border-right: 1px solid var(--line); padding-right: 8px;
+}
+pre.code.src { margin: 0; flex: 1; }
+
+/* Every typed sub-expression is a span. Only the type-carrying ones get colour,
+   so the source still reads as source. */
+.s-unstable { color: var(--red); font-weight: 600; }
+.s-union    { color: var(--yellow); font-weight: 600; }
+.s-runtime  { text-decoration: underline wavy var(--red) 1px; }
+body.hide-stable .s-stable { color: inherit; }
+body:not(.show-warn) .s-unstable,
+body:not(.show-warn) .s-union { color: inherit; font-weight: inherit; }
+
+/* Calls are click targets. Hovering the innermost one highlights just it. */
+.s-call { cursor: pointer; border-radius: 2px; }
+.s-call:hover:not(:has(.s-call:hover)) { background: var(--sel); outline: 1px solid var(--accent); }
+.s-call.sel-src { background: var(--sel); }
+
+/* Type tooltip.
+   Deliberately NOT a CSS ::after on the span: an absolutely-positioned tooltip
+   is clipped by .srcwrap's scroll container (worst on line 1, where it sits
+   above the content box), and the ":hover:not(:has(...))" trick to pick the
+   innermost span silently drops the whole rule in browsers without :has().
+   A single position:fixed element driven by JS has neither problem. */
+#tip {
+  position: fixed; z-index: 50; pointer-events: none;
+  background: var(--fg); color: var(--bg);
+  padding: 3px 8px; border-radius: 4px;
+  font: 11px/1.4 var(--mono); white-space: pre;
+  box-shadow: 0 2px 10px rgba(0,0,0,.3);
+  opacity: 0; transition: opacity .08s;
+}
+#tip.on { opacity: 1; }
+
+/* hovered span gets a subtle underline so you can see what the type refers to */
+.s.hot { outline: 1px dashed var(--accent); border-radius: 2px; }
+
+/* static parameters: `where T = Float64` */
+.sparams { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+.sparams b { color: var(--cyan); font-weight: 600; }
+.s-sparam { color: var(--cyan); }
+
+.srclegend { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
+.srclegend b { font-weight: 600; }
+.srclegend .k-u { color: var(--red); }
+.srclegend .k-n { color: var(--yellow); }
+
+/* ---- ascend: breadcrumb path ---- */
+#crumbs {
+  position: sticky; top: 27px; z-index: 1;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  padding: 5px 12px; background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+#crumbs.empty { display: none; }
+.crumb, .crumb-up {
+  font: inherit; font-size: 11px;
+  background: none; border: 1px solid transparent; border-radius: 4px;
+  color: var(--accent); padding: 1px 5px; cursor: pointer;
+}
+.crumb:hover, .crumb-up:hover { background: var(--panel); border-color: var(--line); }
+.crumb.current { color: var(--fg); font-weight: 600; cursor: default; }
+.crumb.current:hover { background: none; border-color: transparent; }
+.crumb.unstable { color: var(--red); }
+.crumb-sep { color: var(--muted); opacity: .6; }
+.crumb-up {
+  color: var(--muted); border-color: var(--line); margin-right: 6px;
+}
+
+/* the call we just ascended out of */
+.s-call.sel-src {
+  background: var(--sel);
+  outline: 1px solid var(--accent);
+  animation: flash 1.1s ease-out;
+}
+@keyframes flash {
+  0%, 40% { background: var(--accent); color: var(--bg); }
+  100%    { background: var(--sel); }
+}
+
+/* ---- lexical syntax highlighting (source pane) ----
+   Identifiers are intentionally NOT coloured here: they carry the type colours
+   (red = unstable, amber = small union), and a token span nests inside a type
+   span, so colouring them would override the type signal. */
+.tok-kw  { color: var(--syn-kw); font-weight: 600; }
+.tok-com { color: var(--syn-com); font-style: italic; }
+.tok-str { color: var(--syn-str); }
+.tok-num { color: var(--syn-num); }
+.tok-mac { color: var(--syn-mac); }
+.tok-op  { color: var(--syn-op); }
+.tok-pun { color: var(--syn-pun); }
+
+/* Inside a flagged expression keep the punctuation/operators in the warning
+   colour, so "this whole call is unstable" still reads as one unit. */
+body.show-warn .s-unstable .tok-pun, body.show-warn .s-unstable .tok-op,
+body.show-warn .s-union    .tok-pun, body.show-warn .s-union    .tok-op {
+  color: inherit;
+}
+
+body.no-syntax .tok-kw, body.no-syntax .tok-com, body.no-syntax .tok-str,
+body.no-syntax .tok-num, body.no-syntax .tok-mac, body.no-syntax .tok-op,
+body.no-syntax .tok-pun { color: inherit; font-weight: inherit; font-style: normal; }

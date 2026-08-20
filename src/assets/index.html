@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cthulhu</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Cthulhu</h1>
+    <div id="root-sig" class="sig"></div>
+    <div class="spacer"></div>
+    <span id="status" class="status"></span>
+  </header>
+
+  <div id="toolbar">
+    <fieldset>
+      <legend>View</legend>
+      <label><input type="radio" name="view" value="source" checked> Source</label>
+      <label><input type="radio" name="view" value="typed"> Typed</label>
+      <label><input type="radio" name="view" value="ast"> AST</label>
+      <label><input type="radio" name="view" value="llvm"> LLVM</label>
+      <label><input type="radio" name="view" value="native"> Native</label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Data <span class="hint">(refetches tree)</span></legend>
+      <label><input type="checkbox" id="optimize"> optimize</label>
+      <label>debuginfo
+        <select id="debuginfo">
+          <option value="none">none</option>
+          <option value="compact" selected>compact</option>
+          <option value="source">source</option>
+        </select>
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Display <span class="hint">(instant, client-side)</span></legend>
+      <label><input type="checkbox" id="iswarn" checked> warn</label>
+      <label><input type="checkbox" id="showEffects"> effects</label>
+      <label><input type="checkbox" id="showExct"> exception types</label>
+      <label><input type="checkbox" id="showHead"> head</label>
+      <label><input type="checkbox" id="hideStable"> hide type-stable</label>
+      <label><input type="checkbox" id="syntax" checked> syntax</label>
+    </fieldset>
+  </div>
+
+  <main>
+    <section id="tree-pane">
+      <div class="pane-title">Call tree</div>
+      <ul id="tree" class="tree"></ul>
+    </section>
+    <div id="splitter"></div>
+    <section id="code-pane">
+      <div class="pane-title" id="code-title">Code</div>
+      <nav id="crumbs" aria-label="call path"></nav>
+      <div id="code"><p class="note">Select a call to view its code.</p></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
