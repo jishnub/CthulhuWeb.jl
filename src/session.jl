@@ -95,6 +95,7 @@ struct CallLabel
     wrappers::Vector{Symbol}
     name::String
     argtypes::Vector{String}
+    kwargs::Vector{String}
     rt::String
     exct::Union{Nothing,String}
     effects::Union{Nothing,String}
@@ -160,7 +161,7 @@ function Session(provider::AbstractProvider, mi::Core.MethodInstance;
     result === nothing && error("Initial lookup failed for $mi")
     integ = integration_for(result)
 
-    label = CallLabel(:root, Symbol[], sprint(show, mi), String[], string(result.rt),
+    label = CallLabel(:root, Symbol[], sprint(show, mi), String[], String[], string(result.rt),
                       nothing, nothing, false, false, -1, :call, 0,
                       whereis_file(mi)..., )
     root = Node(ROOT_ID, 0, 0, mi, ci, nothing, nothing, label, true, true, 0,
@@ -243,6 +244,7 @@ function classify(s::Session, @nospecialize(info))
     # `@descend` rather than quietly better.
     override = get_override(s.provider, info)
 
+    ci !== nothing && is_kwcall(get_mi(ci)) && push!(wrappers, :kw)
     kind = inner isa integ.ConstPropCallInfo    ? :constprop    :
            inner isa integ.SemiConcreteCallInfo ? :semiconcrete :
            inner isa integ.ConcreteCallInfo     ? :concrete     :
@@ -268,9 +270,9 @@ end
 function make_label(s::Session, @nospecialize(info), c, stmt_id::Int, head::Symbol)
     integ = s.integ
     rt = try get_rt(info) catch; Any end
-    name, argtypes = signature_parts(s, info, c)
+    name, argtypes, kwargs = signature_parts(s, info, c)
     file, line = whereis_file(c.mi)
-    return CallLabel(c.kind, c.wrappers, name, argtypes, string(rt),
+    return CallLabel(c.kind, c.wrappers, name, argtypes, kwargs, string(rt),
                      safe_exct(integ, info), safe_effects(integ, info),
                      is_type_unstable(rt), is_expected_union_safe(rt),
                      stmt_id, head, c.nalt, file, line)
@@ -286,8 +288,9 @@ function signature_parts(s::Session, @nospecialize(info), c)
     inner = integ.ignorewrappers(info)
 
     if c.mi !== nothing
-        tt = c.mi.specTypes
-        return tuple_to_parts(tt)
+        kw = kwcall_parts(c.mi.specTypes)
+        kw === nothing || return kw
+        return tuple_to_parts(c.mi.specTypes)
     end
     if inner isa integ.MultiCallInfo
         return tuple_to_parts(inner.sig)
@@ -295,35 +298,75 @@ function signature_parts(s::Session, @nospecialize(info), c)
     if inner isa integ.RTCallInfo
         f = inner.f
         nm = f isa Type ? string(f) : string(nameof_safe(f))
-        return (nm, String[string(T) for T in inner.argtyps])
+        return (nm, String[string(T) for T in inner.argtyps], String[])
     end
     if inner isa integ.PureCallInfo
         ats = inner.argtypes
         nm = isempty(ats) ? "?" : type_head_name(first(ats))
-        return (nm, String[string(T) for T in ats[2:end]])
+        return (nm, String[string(T) for T in ats[2:end]], String[])
     end
     for fld in (:sig,)
         if hasproperty(inner, fld)
             return tuple_to_parts(getproperty(inner, fld))
         end
     end
-    return (string(nameof(typeof(inner))), String[])
+    return (string(nameof(typeof(inner))), String[], String[])
 end
 
 nameof_safe(@nospecialize(f)) = try nameof(f) catch; Symbol(string(f)) end
 
+"""
+Rewrite a `Core.kwcall` signature into the call the user actually wrote.
+
+`eigen!(x; permute, scale, sortby)` dispatches through
+`Core.kwcall(::NamedTuple{(:permute,:scale,:sortby)}, ::typeof(eigen!), ::Matrix)`.
+Showing that verbatim buries the callee among lowering plumbing; the tree should
+say `eigen!(::Matrix; permute=, scale=, sortby=)`.
+"""
+function kwcall_parts(@nospecialize(tt))
+    try
+        t = Base.unwrap_unionall(tt)
+        (t isa DataType && t <: Tuple) || return nothing
+        ps = collect(t.parameters)
+        length(ps) >= 3 || return nothing
+        first(ps) === typeof(Core.kwcall) || return nothing
+        name = type_head_name(ps[3])
+        args = String[string(T) for T in ps[4:end]]
+        kws = String[]
+        ntu = Base.unwrap_unionall(ps[2])
+        if ntu isa DataType && ntu <: NamedTuple && !isempty(ntu.parameters)
+            append!(kws, string.(ntu.parameters[1]))
+        end
+        return (name, args, kws)
+    catch
+        return nothing
+    end
+end
+
+"Does this MethodInstance come from a `Core.kwcall` dispatch?"
+function is_kwcall(mi)
+    mi === nothing && return false
+    try
+        t = Base.unwrap_unionall(mi.specTypes)
+        return t isa DataType && !isempty(t.parameters) &&
+               first(t.parameters) === typeof(Core.kwcall)
+    catch
+        return false
+    end
+end
+
 function tuple_to_parts(@nospecialize(tt))
     try
         t = Base.unwrap_unionall(tt)
-        t isa DataType && t <: Tuple || return (string(tt), String[])
+        t isa DataType && t <: Tuple || return (string(tt), String[], String[])
         ps = collect(t.parameters)
-        isempty(ps) && return (string(tt), String[])
+        isempty(ps) && return (string(tt), String[], String[])
         # find_callsites can hand back sigs whose first parameter is a CodeInstance
         # (the invoke form), in which case the callee is the second parameter.
         first(ps) === Core.CodeInstance && length(ps) > 1 && (ps = ps[2:end])
-        return (type_head_name(first(ps)), String[string(T) for T in ps[2:end]])
+        return (type_head_name(first(ps)), String[string(T) for T in ps[2:end]], String[])
     catch
-        return (string(tt), String[])
+        return (string(tt), String[], String[])
     end
 end
 

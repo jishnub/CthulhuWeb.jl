@@ -226,6 +226,7 @@ function node_record(s::Session, id::NodeId)
         "wrappers"      => String[string(w) for w in l.wrappers],
         "name"          => l.name,
         "argtypes"      => l.argtypes,
+        "kwargs"        => l.kwargs,
         "rt"            => l.rt,
         "exct"          => l.exct,
         "effects"       => l.effects,

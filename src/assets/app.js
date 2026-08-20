@@ -121,7 +121,9 @@ function labelHTML(n) {
   for (const w of n.wrappers) parts.push(`<span class="wrap">${esc(w)}</span>`);
   if (n.kind !== "edge") parts.push(`<span class="kind k-${esc(n.kind)}">${esc(n.kind)}</span>`);
   parts.push(`<span class="fname">${esc(n.name)}</span>`);
-  parts.push(`<span class="args">(${n.argtypes.map((t) => `::${esc(t)}`).join(", ")})</span>`);
+  const pos = n.argtypes.map((t) => `::${esc(t)}`).join(", ");
+  const kws = (n.kwargs || []).length ? "; " + n.kwargs.map(esc).join(", ") : "";
+  parts.push(`<span class="args">(${pos}${kws})</span>`);
   parts.push(`<span class="rt">::${esc(n.rt)}</span>`);
   if (n.effects) parts.push(`<span class="effects">${esc(n.effects)}</span>`);
   if (n.exct) parts.push(`<span class="exct">(↑::${esc(n.exct)})</span>`);

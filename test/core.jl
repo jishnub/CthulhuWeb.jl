@@ -23,6 +23,9 @@ shim(x, n=2) = x^n + length(string(x))
 # keyword shim whose default value is itself a call, like sqrt_quasitriu's
 kwshim(v; width = eltype(v) <: Complex ? 512 : 256) = length(v) + width
 
+kwinner(v; scale=2, shift=0) = v .* scale .+ shift
+kwouter(v) = kwinner(v; scale=3, shift=1)
+
 # bindings of several shapes, all of which must carry their own annotation
 function annotated(x)
     n = length(string(x))
@@ -429,6 +432,37 @@ end
         @test any(h -> occursin(expect, h.captures[1]), hits)   # a plausible one
         println("  ", rpad(v, 3), " -> ", unique(h.captures[1] for h in hits))
     end
+end
+
+@testset "keyword calls descend into the call, not the lowering" begin
+    # `f(x; kw=1)` lowers to a NamedTuple construction AND the call. Both map to
+    # the same source range, and taking the first in SSA order landed the user in
+    # boot.jl at `NamedTuple{names}(args::Tuple)` instead of `f`.
+    cfg = headless_config(CONFIG; view=:source)
+    kmi = find_method_instance(provider, kwouter, Tuple{Vector{Float64}})
+    s = Session(provider, kmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+
+    ids = [parse(Int, m.captures[1]) for m in eachmatch(r"data-node-id=\"(\d+)\"", html)]
+    @test !isempty(ids)
+    linked = [s.nodes[i] for i in ids]
+    @test !any(n -> startswith(n.label.name, "Type{NamedTuple"), linked)
+    @test !any(n -> n.label.name == "Core.kwcall", linked)   # relabelled, not raw
+
+    # the keyword call is presented as written: name, positional args, keywords
+    kw = findfirst(n -> :kw in n.label.wrappers, linked)
+    @test kw !== nothing
+    lab = linked[kw].label
+    @test lab.name == "kwinner"
+    @test lab.kwargs == ["scale", "shift"]
+    @test !any(a -> occursin("NamedTuple", a), lab.argtypes)
+    @test !any(a -> occursin("typeof(", a), lab.argtypes)    # plumbing arg dropped
+    println("  links to: ", lab.name, "(",
+            join("::" .* lab.argtypes, ", "), "; ", join(lab.kwargs, ", "), ")")
+
+    # and it really is the callee, reachable from the tree
+    @test linked[kw].descendable
 end
 
 @testset "no type is reported where none is known" begin

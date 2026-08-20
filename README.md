@@ -109,6 +109,21 @@ Things that were verified against the source and cost real debugging time:
 - **One compiler worker.** `CthulhuInterpreter` holds five unsynchronised
   `IdDict`s mutated during inference; `process_info` can `@eval Main`.
 
+### Keyword calls
+
+`f(x; kw=1)` lowers to a `NamedTuple` construction *and* the call itself, and
+both map to the same source range. Taking the first in SSA order landed a click
+on `eigen!(...; permute, scale, sortby)` in `boot.jl` at
+`NamedTuple{names}(args::Tuple)` — lowering plumbing, not the function written.
+`pick_callsite` ranks the candidates: a callee whose name matches the source
+text, then `Core.kwcall`, then anything that is not a NamedTuple constructor.
+
+The resulting node is also relabelled. `Core.kwcall(::NamedTuple{(:permute,
+:scale, :sortby)}, ::typeof(eigen!), ::Matrix)` is shown as
+`eigen!(::Matrix{Float64}; permute, scale, sortby)` with a `kw` badge —
+keywords are carried in their own label field rather than faked as argument
+types, and the `::typeof(f)` plumbing argument is dropped.
+
 ### Correctness principle: never invent a type
 
 Every annotation bug found in this view had the same shape — a construct with no

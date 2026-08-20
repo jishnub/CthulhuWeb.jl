@@ -115,6 +115,32 @@ function emit_code(io::IO, src, a::Int, b::Int, cm, offset::Int)
 end
 
 """
+Choose which callsite a source range should descend into when several share it.
+
+`eigen!(x; permute, scale, sortby)` produces a `NamedTuple` construction as well
+as the call. Taking the first in SSA order landed the user in `boot.jl` at
+`NamedTuple{names}(args::Tuple)` -- lowering plumbing, not the function they
+clicked. Prefer, in order: a callee whose name matches what is written in the
+source, then `Core.kwcall` (the real dispatch for a keyword call), then anything
+that is not an obvious NamedTuple constructor.
+"""
+function pick_callsite(s::Session, cands::Vector{Int}, spantext::AbstractString)
+    length(cands) == 1 && return only(cands)
+    lead = match(r"^\s*([A-Za-z_][A-Za-z0-9_!]*)", spantext)
+    leadname = lead === nothing ? nothing : String(lead.captures[1])
+    function score(k)
+        nm = s.nodes[k].label.name
+        if leadname !== nothing && (nm == leadname || endswith(nm, "." * leadname))
+            return 3
+        end
+        nm == "Core.kwcall" && return 2
+        startswith(nm, "Type{NamedTuple") && return 0
+        return 1
+    end
+    return cands[argmax(map(score, cands))]
+end
+
+"""
 Is `child` the body method of `parent`? Julia lowers `f(x, n=1)` to a shim `f(x)`
 calling `f(x, 1)`, and `f(x; kw=1)` to a shim calling a gensym `#f#NN`. Other
 children of a shim are default-value computations (`eltype(A0)` in
@@ -140,7 +166,9 @@ function body_label(n::Node)
     m === nothing || (name = String(m.captures[1]))
     args = [a for a in n.label.argtypes if !startswith(a, "typeof(")]
     args = [length(a) > 40 ? first(a, 37) * "…" : a for a in args]
-    return name * "(" * join(["::" * a for a in args], ", ") * ")"
+    sig = join(["::" * a for a in args], ", ")
+    isempty(n.label.kwargs) || (sig *= "; " * join(n.label.kwargs, ", "))
+    return name * "(" * sig * ")"
 end
 
 """
@@ -198,12 +226,16 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     try
         callsites, sourcenodes = find_callsites(s.provider, result, node.ci, true)
         if length(kids) == length(callsites) == length(sourcenodes)
+            # Several callsites can share ONE source range: `f(x; kw=1)` lowers to
+            # a NamedTuple construction *and* the call itself. Collect the
+            # candidates and choose, rather than letting SSA order decide.
+            cands = Dict{Tuple{Int,Int},Vector{Int}}()
             for (i, sn) in enumerate(sourcenodes)
                 isa(sn, Callsite) && continue      # no source node for this callsite
-                key = (first_byte(sn), last_byte(sn))
-                # a span may cover several callsites (nested calls); first wins,
-                # and the inner calls get their own narrower spans anyway.
-                get!(callsite_map, key, kids[i])
+                push!(get!(cands, (first_byte(sn), last_byte(sn)), Int[]), kids[i])
+            end
+            for (key, ks) in cands
+                callsite_map[key] = pick_callsite(s, ks, String(tsn.source[key[1]:key[2]]))
             end
         end
     catch
