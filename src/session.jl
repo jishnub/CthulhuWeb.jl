@@ -55,7 +55,7 @@ Failed/Generated (callsite.jl:66-79). Never let either reach the server loop."
 function try_get_ci(@nospecialize(info))
     try
         ci = with_logger(NullLogger()) do
-            C.get_ci(info)
+            get_ci(info)
         end
         return ci isa Core.CodeInstance ? ci : nothing
     catch
@@ -142,9 +142,9 @@ const NULL_TERMINAL = Ref{REPL.Terminals.TTYTerminal}()
 "Force off the settings that would let a browser toggle run an editor or a
 subprocess on the host. jump_always calls edit() (descend.jl:66-76); the vscode
 flags are normally false but are TRUE when launched from a VSCode Julia REPL."
-function headless_config(base::CthulhuConfig = C.CONFIG; kwargs...)
-    cfg = C.set_config(base; kwargs...)
-    return C.set_config(cfg;
+function headless_config(base::CthulhuConfig = CONFIG; kwargs...)
+    cfg = set_config(base; kwargs...)
+    return set_config(cfg;
         jump_always        = false,
         inlay_types_vscode = false,
         diagnostics_vscode = false,
@@ -155,8 +155,8 @@ end
 
 function Session(provider::AbstractProvider, mi::Core.MethodInstance;
                  config::CthulhuConfig = headless_config(), max_depth::Int = 64)
-    ci = C.generate_code_instance(provider, mi)
-    result = C.lookup(provider, ci, config.optimize)
+    ci = generate_code_instance(provider, mi)
+    result = lookup(provider, ci, config.optimize)
     result === nothing && error("Initial lookup failed for $mi")
     integ = integration_for(result)
 
@@ -191,7 +191,7 @@ function lookup_cached!(s::Session, node::Node, optimize::Bool)
     key = something(node.override, node.ci)
     per = get!(() -> Dict{Bool,Any}(), s.results, key)
     return get!(per, optimize) do
-        C.lookup(s.provider, key, optimize)   # may return nothing (descend.jl:63)
+        lookup(s.provider, key, optimize)   # may return nothing (descend.jl:63)
     end
 end
 
@@ -231,7 +231,7 @@ function classify(s::Session, @nospecialize(info))
         ci = try_get_ci(wrapped)
         # NB: descend.jl:126 sets state.ci but NOT state.mi -- an upstream bug that
         # makes the renderers use the parent's mi with the task's ci. Set both.
-        return (kind=:task, wrappers, mi=(ci === nothing ? nothing : C.get_mi(ci)), ci,
+        return (kind=:task, wrappers, mi=(ci === nothing ? nothing : get_mi(ci)), ci,
                 override=nothing, descendable=(ci !== nothing),
                 expandable=(ci !== nothing), nalt=0)
     end
@@ -241,7 +241,7 @@ function classify(s::Session, @nospecialize(info))
     # (compiler/interface.jl:23-25), so a LimitedCallInfo(ConstPropCallInfo(...))
     # yields nothing in the TUI too. Matching that keeps the web tree identical to
     # `@descend` rather than quietly better.
-    override = C.get_override(s.provider, info)
+    override = get_override(s.provider, info)
 
     kind = inner isa integ.ConstPropCallInfo    ? :constprop    :
            inner isa integ.SemiConcreteCallInfo ? :semiconcrete :
@@ -256,7 +256,7 @@ function classify(s::Session, @nospecialize(info))
     # still DISPLAYS such a callsite (the menu is built from all of them,
     # descend.jl:102-106); it only refuses to enter. So list it, mark it inert.
     dead = ci === nothing && override === nothing
-    return (; kind, wrappers, mi=(ci === nothing ? nothing : C.get_mi(ci)), ci, override,
+    return (; kind, wrappers, mi=(ci === nothing ? nothing : get_mi(ci)), ci, override,
             descendable=!dead, expandable=!dead, nalt=0)
 end
 
@@ -267,17 +267,17 @@ end
 # ---------------------------------------------------------------------------
 function make_label(s::Session, @nospecialize(info), c, stmt_id::Int, head::Symbol)
     integ = s.integ
-    rt = try C.get_rt(info) catch; Any end
+    rt = try get_rt(info) catch; Any end
     name, argtypes = signature_parts(s, info, c)
     file, line = whereis_file(c.mi)
     return CallLabel(c.kind, c.wrappers, name, argtypes, string(rt),
                      safe_exct(integ, info), safe_effects(integ, info),
-                     C.is_type_unstable(rt), is_expected_union_safe(rt),
+                     is_type_unstable(rt), is_expected_union_safe(rt),
                      stmt_id, head, c.nalt, file, line)
 end
 
 is_expected_union_safe(@nospecialize(rt)) =
-    try rt isa Union && Cthulhu.InteractiveUtils.is_expected_union(rt) catch; false end
+    try rt isa Union && is_expected_union(rt) catch; false end
 
 "Recover (function name, argument types) from the callee's specTypes when we have
 one, else from the CallInfo's own `sig`/`argtyps` fields."
@@ -417,7 +417,7 @@ function expand!(s::Session, id::NodeId; optimize::Bool = s.config.optimize)
             # find_callsites needs the node's ORIGINAL ci even when `result` came
             # from an override -- cf. descend.jl:62 vs :98. `annotate_source=false`:
             # the 4th arg only populates the parallel sourcenodes vector.
-            callsites, _ = C.find_callsites(s.provider, result, ci, false)
+            callsites, _ = find_callsites(s.provider, result, ci, false)
             for (i, cs) in enumerate(callsites)
                 push!(kids, intern_child!(s, node, cs.info, cs.id, cs.head, i, optimize))
             end

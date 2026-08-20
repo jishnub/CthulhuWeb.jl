@@ -55,12 +55,12 @@ const TOKCLASS = ("kw", "com", "str", "num", "mac", "op", "pun")
 function tokclass(k)::UInt8
     ks = string(k)
     ks == "Comment"                                    && return 0x02
-    JS.is_keyword(k)                                   && return 0x01
+    is_keyword(k)                                   && return 0x01
     ks in ("String", "Char", "CmdString")              && return 0x03
     ks in ("\"", "'", "`", "\"\"\"")                     && return 0x03
     ks in ("Integer", "Float", "BinInt", "OctInt", "HexInt", "float") && return 0x04
     ks in ("MacroName", "@", "StringMacroName", "CmdMacroName")       && return 0x05
-    JS.is_operator(k)                                  && return 0x06
+    is_operator(k)                                  && return 0x06
     ks in ("(", ")", "[", "]", "{", "}", ",", ";")     && return 0x07
     return 0x00
 end
@@ -76,10 +76,10 @@ function token_classmap(src, first_b::Int, last_b::Int)
     n <= 0 && return cm
     try
         text = String(src[first_b:last_b])
-        for t in JS.tokenize(text)
+        for t in tokenize(text)
             r = t.range
             isempty(r) && continue
-            c = tokclass(JS.kind(t))
+            c = tokclass(kind(t))
             c == 0x00 && continue
             for i in Int(first(r)):min(Int(last(r)), n)
                 cm[i] = c
@@ -128,7 +128,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     isa(result.src, Core.CodeInfo) || return nothing
 
     tsn = try
-        t, _ = C.get_typed_sourcetext(node.mi, result.src, result.rt)
+        t, _ = get_typed_sourcetext(node.mi, result.src, result.rt)
         t
     catch
         nothing
@@ -138,12 +138,12 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     # Map source spans -> child node ids by position.
     callsite_map = Dict{Tuple{Int,Int},Int}()
     try
-        callsites, sourcenodes = C.find_callsites(s.provider, result, node.ci, true)
+        callsites, sourcenodes = find_callsites(s.provider, result, node.ci, true)
         kids = expand!(s, node.id; optimize=false)
         if length(kids) == length(callsites) == length(sourcenodes)
             for (i, sn) in enumerate(sourcenodes)
-                isa(sn, C.Callsite) && continue      # no source node for this callsite
-                key = (JS.first_byte(sn), JS.last_byte(sn))
+                isa(sn, Callsite) && continue      # no source node for this callsite
+                key = (first_byte(sn), last_byte(sn))
                 # a span may cover several callsites (nested calls); first wins,
                 # and the inner calls get their own narrower spans anyway.
                 get!(callsite_map, key, kids[i])
@@ -155,26 +155,26 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     # Mirrors cthulhu_typed (codeview.jl:110-118): a method that only fills in
     # default arguments has an empty body, so stop after the signature.
-    kids_tsn = JS.children(tsn)
+    kids_tsn = children(tsn)
     idxend = lastindex(tsn.source)
     truncated = false
     if kids_tsn !== nothing && length(kids_tsn) == 2
         sig, body = kids_tsn
-        if C.is_leaf(body)
-            idxend = JS.last_byte(sig)
+        if is_leaf(body)
+            idxend = last_byte(sig)
             truncated = true
         end
     end
 
     src = tsn.source
     sparams = Dict{String,String}(static_params(node.mi))
-    startb = JS.first_byte(tsn)
+    startb = first_byte(tsn)
     cm = token_classmap(src, startb, idxend)
     io = IOBuffer()
     walk_source(io, tsn, startb, src, callsite_map, idxend, cfg, sparams, cm, startb)
     code = String(take!(io))
 
-    firstline = JS.source_line(src, JS.first_byte(tsn))
+    firstline = source_line(src, first_byte(tsn))
     nlines = count(==('\n'), code) + 1
     gutter = join(string.(firstline:(firstline + nlines - 1)), "\n")
 
@@ -198,7 +198,7 @@ Returns the next byte position to emit. Ranges from a syntax tree nest properly
 by construction, so the spans can never overlap-without-containment."
 function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
                      cfg::CthulhuConfig, sparams::Dict{String,String}, cm, offset::Int)
-    fb, lb = JS.first_byte(node), JS.last_byte(node)
+    fb, lb = first_byte(node), last_byte(node)
     fb > idxend && return pos
     lb = min(lb, idxend)
     lb < fb && return pos
@@ -209,7 +209,7 @@ function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
     opened = open_span(io, node, fb, lb, src, callsite_map, cfg, sparams)
 
     p = fb
-    kids = JS.children(node)
+    kids = children(node)
     if kids !== nothing
         for c in kids
             p = walk_source(io, c, p, src, callsite_map, idxend, cfg, sparams, cm, offset)
@@ -236,12 +236,12 @@ function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
     typ = node.typ
     typ !== nothing && uninteresting_const(typ) && (typ = nothing)
     nodeid = get(callsite_map, (fb, lb), 0)
-    runtime = try TS.is_runtime(node) catch; false end
+    runtime = try is_runtime(node) catch; false end
 
     # A `T` in the signature is plain source text with no inferred type. Bind it
     # to this specialization's static parameter so hovering it says `Float64`.
     issparam = false
-    if typ === nothing && !isempty(sparams) && JS.kind(node) === JS.K"Identifier"
+    if typ === nothing && !isempty(sparams) && kind(node) === K"Identifier"
         val = get(sparams, String(src[fb:lb]), nothing)
         if val !== nothing
             typ = val
@@ -254,7 +254,7 @@ function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
     classes = ["s"]
     issparam && push!(classes, "s-sparam")
     if typ !== nothing && !issparam
-        if C.is_type_unstable(typ)
+        if is_type_unstable(typ)
             push!(classes, is_expected_union_safe(typ) ? "s-union" : "s-unstable")
         else
             push!(classes, "s-stable")

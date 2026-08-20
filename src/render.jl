@@ -193,14 +193,14 @@ function render_body(s::Session, node::Node, cfg::CthulhuConfig)
     ansi = try
         # NB: stringify(f, ::IOContext) does NOT add :color=>true (ui.jl:98 only
         # does so for the ::IO method). Without it you silently get plain text.
-        C.stringify(IOContext(IOBuffer(),
+        stringify(IOContext(IOBuffer(),
                 :color            => true,
                 :limit            => true,
                 :displaysize      => (40, 200),
-                :SOURCE_SLOTNAMES => C.source_slotnames(result),
+                :SOURCE_SLOTNAMES => source_slotnames(result),
                 :effects          => cfg.effects,
                 :exception_types  => cfg.exception_types)) do io
-            C.view_function(state)(io, s.provider, state, result)
+            view_function(state)(io, s.provider, state, result)
         end
     catch err
         return "<p class=\"err\">" * html_escape(sprint(showerror, err)) * "</p>"

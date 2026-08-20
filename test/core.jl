@@ -1,10 +1,11 @@
 # Smoke tests for the headless core. Run with:  julia --project=web web/test_core.jl
 using Test
 using Cthulhu
-using Cthulhu: CthulhuConfig, CthulhuState
+using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
+                find_method_instance
 using CthulhuWeb
 # internals under test
-using CthulhuWeb: C, ESC, NodeId, ROOT_ID, Session, ansi_to_html, expand!,
+using CthulhuWeb: ESC, NodeId, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
                   source_html, static_params, token_classmap
 
@@ -43,8 +44,8 @@ function span_content(html::AbstractString, id::Int)
     return html[i:end]
 end
 
-provider = C.AbstractProvider(C.CC.NativeInterpreter())
-mi = C.find_method_instance(provider, f, Tuple{})
+provider = AbstractProvider(Base.Compiler.NativeInterpreter())
+mi = find_method_instance(provider, f, Tuple{})
 
 @testset "session core" begin
     s = Session(provider, mi)
@@ -94,12 +95,12 @@ end
     #  2. On a COLD interpreter the recursive edge is missing even unoptimized;
     #     it only appears once the CodeInstance has been inferred already. So warm
     #     the provider first, then look at the unoptimized tree.
-    provider2 = C.AbstractProvider(C.CC.NativeInterpreter())
-    rmi = C.find_method_instance(provider2, rec, Tuple{Int})
-    warm = Session(provider2, rmi; config=headless_config(C.CONFIG; view=:typed, optimize=true))
+    provider2 = AbstractProvider(Base.Compiler.NativeInterpreter())
+    rmi = find_method_instance(provider2, rec, Tuple{Int})
+    warm = Session(provider2, rmi; config=headless_config(CONFIG; view=:typed, optimize=true))
     expand!(warm, ROOT_ID)
 
-    s = Session(provider2, rmi; config=headless_config(C.CONFIG; view=:typed, optimize=false))
+    s = Session(provider2, rmi; config=headless_config(CONFIG; view=:typed, optimize=false))
     kids = expand!(s, ROOT_ID)
     names = [s.nodes[k].label.name for k in kids]
     println("rec callsites (warm, unoptimized): ", names)
@@ -145,7 +146,7 @@ end
 @testset "render bodies" begin
     s = Session(provider, mi)
     for view in (:typed, :llvm, :native, :source)
-        cfg = headless_config(C.CONFIG; view, iswarn=true)
+        cfg = headless_config(CONFIG; view, iswarn=true)
         html = render_body(s, s.nodes[ROOT_ID], cfg)
         @test html isa String
         @test !occursin(ESC, html)          # every escape consumed
@@ -159,8 +160,8 @@ end
 end
 
 @testset "source view" begin
-    smi = C.find_method_instance(provider, srcdemo, Tuple{Float64})
-    cfg = headless_config(C.CONFIG; view=:source, iswarn=true)
+    smi = find_method_instance(provider, srcdemo, Tuple{Float64})
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
     s = Session(provider, smi; config=cfg)
     html = source_html(s, s.nodes[ROOT_ID], cfg)
     @test html !== nothing
@@ -206,17 +207,17 @@ end
     @test !occursin("<pre class=\"code\">", body)   # the ANSI wrapper
 
     # ...and a node with no typed source still falls back rather than erroring
-    cfg2 = headless_config(C.CONFIG; view=:typed)
+    cfg2 = headless_config(CONFIG; view=:typed)
     @test occursin("<pre class=\"code\">", render_body(s, s.nodes[ROOT_ID], cfg2))
 end
 
 @testset "static parameters" begin
     # The reported case: descending into `+(x::T, y::T) where {T<:IEEEFloat}`.
     # The source text keeps the generic `T`, but this specialization binds it.
-    pmi = C.find_method_instance(provider, +, Tuple{Float64,Float64})
+    pmi = find_method_instance(provider, +, Tuple{Float64,Float64})
     @test static_params(pmi) == ["T" => "Float64"]
 
-    cfg = headless_config(C.CONFIG; view=:source, iswarn=true)
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
     s = Session(provider, pmi; config=cfg)
     html = source_html(s, s.nodes[ROOT_ID], cfg)
     @test html !== nothing
@@ -233,18 +234,18 @@ end
     @test !occursin("s-sparam s-unstable", html)
 
     # ordering with two parameters (declaration order, not reversed)
-    cmi = C.find_method_instance(provider, tp_combine, Tuple{TPBox{Int,String},Int})
+    cmi = find_method_instance(provider, tp_combine, Tuple{TPBox{Int,String},Int})
     @test static_params(cmi) == ["A" => "Int64", "B" => "String"]
 
     # methods with no `where` get no header
-    smi = C.find_method_instance(provider, srcdemo, Tuple{Float64})
+    smi = find_method_instance(provider, srcdemo, Tuple{Float64})
     @test isempty(static_params(smi))
     @test !occursin("class=\"sparams\"", source_html(s, Session(provider, smi; config=cfg).nodes[ROOT_ID], cfg))
 end
 
 @testset "syntax highlighting" begin
-    cfg = headless_config(C.CONFIG; view=:source, iswarn=true)
-    smi = C.find_method_instance(provider, syndemo, Tuple{Float64})
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    smi = find_method_instance(provider, syndemo, Tuple{Float64})
     s = Session(provider, smi; config=cfg)
     html = source_html(s, s.nodes[ROOT_ID], cfg)
     @test html !== nothing

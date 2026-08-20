@@ -74,7 +74,7 @@ function op_config(s::Session, key::String, value)
     # `debuginfo` and `view` are Symbols; the rest are Bools.
     (sym === :view || sym === :debuginfo) && (val = Symbol(value))
     prev_opt = s.config.optimize
-    s.config = headless_config(C.set_config(s.config, NamedTuple((sym => val,))))
+    s.config = headless_config(set_config(s.config, NamedTuple((sym => val,))))
     # Only `optimize` changes the child set. `view` reaches the data solely via
     # `optimize &= view !== :source` (config.jl:24), which is why we compare the
     # RESULTING optimize bit rather than the requested one -- setting optimize=true
@@ -118,6 +118,41 @@ end
 port in a REPL replaces the old one instead of failing to bind."""
 const SERVERS = Dict{Int,Any}()
 
+const DEFAULT_PORT = 8000
+const PORT_SCAN = 50
+
+"Is `port` bindable right now? Racy by nature, but enough to give a good error
+instead of a TaskFailedException out of HTTP's listener task."
+function port_free(port::Int)
+    try
+        close(Sockets.listen(Sockets.localhost, port))
+        return true
+    catch
+        return false
+    end
+end
+
+"""
+Resolve the port to serve on.
+
+- `nothing` (the default): reuse `DEFAULT_PORT` if we already own it — so
+  successive runs replace in place and the browser tab keeps working — otherwise
+  the first free port at or after it.
+- an explicit port: that port or nothing. Silently moving would be worse than
+  failing when the caller named one.
+"""
+function pick_port(requested::Union{Nothing,Int})
+    if requested !== nothing
+        (haskey(SERVERS, requested) || port_free(requested)) && return requested
+        error("port $requested is already in use by another process. " *
+              "Pass a different `port`, or omit `port` to pick a free one automatically.")
+    end
+    for p in DEFAULT_PORT:(DEFAULT_PORT + PORT_SCAN)
+        (haskey(SERVERS, p) || port_free(p)) && return p
+    end
+    error("no free port found in $DEFAULT_PORT:$(DEFAULT_PORT + PORT_SCAN); pass `port` explicitly.")
+end
+
 """
     stop_web()          # stop every server
     stop_web(port)      # stop the one on `port`
@@ -144,20 +179,29 @@ macro descend_web(ex0...)
 end
 
 """
-    descend_web(f, argtypes; port=8000, kwargs...)
+    descend_web(f, argtypes; port=nothing, kwargs...)
     descend_web(tt::Type{<:Tuple}; ...)
     descend_web(mi::MethodInstance; ...)
 
 Serve Cthulhu's call tree as a clickable nested list at http://localhost:port.
-Keyword arguments are the usual `Cthulhu.CONFIG` options (`view`, `optimize`,
-`iswarn`, ...). Blocks until interrupted; Ctrl-C to stop.
+
+With no `port`, serves on $DEFAULT_PORT, reusing it if this session already owns
+it — so re-running replaces the previous server in place and an open browser tab
+keeps working — or the next free port if something else holds it. Pass `port`
+explicitly to demand a specific one, or to run several side by side.
+
+Other keyword arguments are the usual `Cthulhu.CONFIG` options (`view`,
+`optimize`, `iswarn`, ...).
+
+Returns `nothing`; use [`stop_web`](@ref) to shut the server down. The running
+servers live in `CthulhuWeb.SERVERS`, keyed by port, if you need the handle.
 """
-function descend_web(@nospecialize(args...); port::Int = 8000,
-                     interp = C.CC.NativeInterpreter(),
-                     provider = C.AbstractProvider(interp),
+function descend_web(@nospecialize(args...); port::Union{Nothing,Int} = nothing,
+                     interp = Base.Compiler.NativeInterpreter(),
+                     provider = AbstractProvider(interp),
                      open_browser::Bool = false, kwargs...)
     mi = _resolve_mi(provider, args...)
-    cfg = headless_config(C.CONFIG; kwargs...)
+    cfg = headless_config(CONFIG; kwargs...)
     session = on_worker(() -> Session(provider, mi; config = cfg))
     session isa Session || error("failed to start session: $session")
 
@@ -182,20 +226,30 @@ function descend_web(@nospecialize(args...); port::Int = 8000,
         return nothing
     end
 
+    port = pick_port(port)
     haskey(SERVERS, port) && stop_web(port)
-    server = HTTP.listen!(apphandler, "127.0.0.1", port)
+    server = try
+        HTTP.listen!(apphandler, "127.0.0.1", port)
+    catch err
+        # HTTP binds inside a task, so a bind failure surfaces wrapped
+        error("could not serve on port $port: " *
+              first(sprint(showerror, err), 200))
+    end
     SERVERS[port] = server
 
     url = "http://localhost:$port"
     @info "Cthulhu web UI at $url  —  $(mi)  (stop_web() to shut down)"
     open_browser && try run(`xdg-open $url`; wait=false) catch end
-    return server
+    # Return nothing, like `Cthulhu.descend`: echoing the HTTP.Server at the REPL
+    # dumps the whole Session, LookupResult and CodeInfo. The server is kept in
+    # `SERVERS` and torn down with `stop_web()`.
+    return nothing
 end
 
 _resolve_mi(provider, mi::Core.MethodInstance) = mi
 function _resolve_mi(provider, @nospecialize(args...))
     world = Base.tls_world_age()
-    mi = C.find_method_instance(provider, args..., world)
+    mi = find_method_instance(provider, args..., world)
     isa(mi, Core.MethodInstance) || error("No method instance found for $(join(args, ", "))")
     return mi
 end

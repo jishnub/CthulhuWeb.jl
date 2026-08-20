@@ -9,7 +9,7 @@ wsdemo() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
 usermacro(x) = (T = x > 0 ? Int64 : Float64; sqrt(abs(rand(T))))
 
 const PORT = 8765
-server = descend_web(wsdemo, Tuple{}; port=PORT, view=:typed, iswarn=true)
+descend_web(wsdemo, Tuple{}; port=PORT, view=:typed, iswarn=true)
 sleep(1.0)
 
 "Send one op and wait for the matching reply, skipping acks."
@@ -140,7 +140,7 @@ try
     end
     @testset "@descend_web / lifecycle" begin
         # a user-defined function driven through the macro, kwargs and all
-        srv = @descend_web port=8766 view=:source iswarn=true usermacro(1.5)
+        @descend_web port=8766 view=:source iswarn=true usermacro(1.5)
         sleep(0.5)
         try
             @test HTTP.get("http://localhost:8766/"; status_exception=false).status == 200
@@ -159,7 +159,7 @@ try
             end
 
             # re-running on the same port replaces rather than failing to bind
-            srv2 = @descend_web port=8766 usermacro(1.5)
+            @descend_web port=8766 usermacro(1.5)
             sleep(0.5)
             @test HTTP.get("http://localhost:8766/"; status_exception=false).status == 200
             @test length([p for p in keys(SERVERS) if p == 8766]) == 1
@@ -171,7 +171,34 @@ try
         @test_throws Exception HTTP.get("http://localhost:8766/"; retry=false)
     end
 
+    @testset "port handling" begin
+        using Sockets
+        f1(x) = sin(abs(x))
+        # explicit port that a foreign process holds -> clear error, no silent move
+        blocker = Sockets.listen(Sockets.localhost, 8791)
+        try
+            err = try
+                descend_web(f1, Tuple{Float64}; port=8791); nothing
+            catch e; sprint(showerror, e) end
+            @test err !== nothing
+            @test occursin("already in use", err)
+            @test !occursin("TaskFailedException", err)
+            @test !haskey(SERVERS, 8791)
+        finally
+            close(blocker)
+        end
+
+        # descend_web returns nothing, not the HTTP.Server (which echoes a huge
+        # Session/LookupResult/CodeInfo at the REPL)
+        @test descend_web(f1, Tuple{Float64}; port=8792) === nothing
+        @test haskey(SERVERS, 8792)
+        # ...and re-running the same port replaces rather than accumulating
+        @test descend_web(f1, Tuple{Float64}; port=8792) === nothing
+        @test count(==(8792), keys(SERVERS)) == 1
+        stop_web(8792)
+        @test !haskey(SERVERS, 8792)
+    end
+
 finally
-    close(server)
     stop_web()
 end
