@@ -28,6 +28,9 @@ julia> @descend_web f(1.0)
 [ Info: Cthulhu web UI at http://localhost:8000 — MethodInstance for f(::Float64)
 ```
 
+<img width="1903" height="646" alt="image" src="https://github.com/user-attachments/assets/d733e257-e19f-4411-af5a-a9228ce531fb" />
+
+
 Options are the usual `Cthulhu.CONFIG` keywords, plus `port`:
 
 ```julia
