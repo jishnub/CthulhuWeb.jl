@@ -247,7 +247,24 @@ root is ready. Measured on `sqrt(::Matrix{Float64})`: `descend_web` returns in
 
 One consequence worth knowing: inference runs on a single worker, so issuing a
 second `@descend_web` while a slow one is still analysing queues behind it rather
-than running in parallel.
+than running in parallel. `web_status()` shows what is happening:
+
+```julia
+julia> web_status()
+servers        : http://localhost:8000
+analysis worker: running
+queued jobs    : 1
+waiting callers: 1
+```
+
+A page sitting on "initializing" with `queued jobs` above zero is waiting its
+turn, not hung.
+
+The worker is supervised: if it dies, waiting callers are failed with an error
+rather than left blocked forever, and the next call respawns it. Jobs run through
+`Base.invokelatest`, because the worker is long-lived and its world age is older
+than anything defined — or any package loaded — since it started; calling
+directly fails with "method too new to be called from this world context".
 
 ### Progress feedback
 

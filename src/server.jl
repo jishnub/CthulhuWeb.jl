@@ -20,30 +20,87 @@ end
 const JOBS = Ref{Channel{Job}}()       # bounded -> back-pressure; see __init__
 const WORKER = Ref{Union{Nothing,Task}}(nothing)
 
+"Reply channels of callers currently waiting on the worker, so a worker death can
+fail them instead of leaving them blocked forever."
+const PENDING = Set{Channel{Any}}()
+const PENDING_LOCK = ReentrantLock()
+
 function ensure_worker!()
     w = WORKER[]
     (w !== nothing && !istaskdone(w)) && return w
     # Threads.@spawn, not @async: a 10-second inference must not freeze the REPL.
     # Only this task ever touches the compiler.
-    WORKER[] = Threads.@spawn while true
+    worker = Threads.@spawn while true
         job = take!(JOBS[])
         result = try
-            job.f()
+            # invokelatest: the worker is a long-lived task, so its world age is
+            # older than anything defined since it started. Calling job.f()
+            # directly fails with "method too new to be called from this world
+            # context" for work created after the first descend_web.
+            Base.invokelatest(job.f)
         catch err
             Dict{String,Any}("op" => "error",
                              "msg" => sprint(showerror, err, catch_backtrace()))
         end
-        put!(job.reply, result)
+        # try/finally: if replying itself fails the caller must not be stranded
+        try
+            put!(job.reply, result)
+        catch
+            isopen(job.reply) && close(job.reply)
+        end
     end
-    return WORKER[]
+    WORKER[] = worker
+
+    # Supervisor. Without it, a worker that dies leaves every caller blocked in
+    # `take!(reply)` forever -- the queue simply stops draining and the UI looks
+    # hung with no error anywhere.
+    Threads.@spawn begin
+        try; wait(worker); catch; end
+        @lock PENDING_LOCK begin
+            for ch in PENDING
+                try
+                    put!(ch, Dict{String,Any}("op" => "error",
+                        "msg" => "the analysis worker died; run stop_web() and try again"))
+                catch
+                end
+            end
+            empty!(PENDING)
+        end
+        @error "CthulhuWeb: analysis worker died" exception=(
+            worker.result isa Exception ? worker.result : ErrorException("unknown"))
+    end
+    return worker
 end
 
 "Run `f` on the single compiler worker and wait for its result."
 function on_worker(f::Function)
     ensure_worker!()
     reply = Channel{Any}(1)
-    put!(JOBS[], Job(f, reply))
-    return take!(reply)
+    @lock PENDING_LOCK push!(PENDING, reply)
+    try
+        put!(JOBS[], Job(f, reply))
+        return take!(reply)
+    finally
+        @lock PENDING_LOCK delete!(PENDING, reply)
+    end
+end
+
+"""
+    web_status()
+
+Report what the server is doing: running servers, the state of the single
+analysis worker, and how much work is queued behind it. Inference is serialised,
+so a page that sits on "initializing" is usually queued rather than hung.
+"""
+function web_status(io::IO = stdout)
+    println(io, "servers        : ", isempty(SERVERS) ? "none" :
+                join(("http://localhost:$p" for p in sort(collect(keys(SERVERS)))), ", "))
+    w = WORKER[]
+    println(io, "analysis worker: ", w === nothing ? "not started" :
+                istaskfailed(w) ? "FAILED" : istaskdone(w) ? "finished" : "running")
+    println(io, "queued jobs    : ", isassigned(JOBS) ? Base.n_avail(JOBS[]) : 0)
+    println(io, "waiting callers: ", @lock PENDING_LOCK length(PENDING))
+    return nothing
 end
 
 # ---------------------------------------------------------------------------

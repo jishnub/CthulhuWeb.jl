@@ -38,7 +38,7 @@ using HTTP
 using JSON3
 using Sockets
 
-export descend_web, @descend_web, stop_web
+export descend_web, @descend_web, stop_web, web_status
 
 const ASSETS = joinpath(@__DIR__, "assets")
 
@@ -58,6 +58,7 @@ function __init__()
         IOContext(devnull, :color => true, :displaysize => (40, 200)),
         devnull)
     empty!(SERVERS)
+    empty!(PENDING)
     return nothing
 end
 

@@ -231,6 +231,45 @@ try
         @test occursin("@keyframes spin", css)
     end
 
+    @testset "worker death does not strand callers" begin
+        # Without a supervisor a dead worker leaves every caller blocked in
+        # take!(reply) forever: the queue stops draining and the UI looks hung
+        # with no error reported anywhere.
+        using CthulhuWeb: on_worker, WORKER, ensure_worker!, PENDING
+        ensure_worker!()
+        @test WORKER[] !== nothing && !istaskdone(WORKER[])
+
+        # a job that throws must come back as an error, not hang
+        r = on_worker(() -> error("boom"))
+        @test r isa AbstractDict && r["op"] == "error"
+        @test occursin("boom", r["msg"])
+        @test isempty(PENDING)                       # caller deregistered
+
+        # the worker survives a failing job and keeps serving
+        @test on_worker(() -> 1 + 1) == 2
+        @test !istaskdone(WORKER[])
+
+        # kill it outright: pending callers must be failed, not stranded
+        w = WORKER[]
+        schedule(w, InterruptException(); error=true)
+        t = @elapsed begin
+            out = on_worker(() -> 42)     # respawns, or errors -- must not hang
+        end
+        @test t < 30
+        println("  after worker kill, on_worker returned ", out, " in ",
+                round(t, digits=2), "s")
+    end
+
+    @testset "web_status" begin
+        using CthulhuWeb: web_status
+        out = sprint(web_status)
+        @test occursin("analysis worker", out)
+        @test occursin("queued jobs", out)
+        @test occursin("waiting callers", out)
+        @test occursin("localhost:$PORT", out)       # the live server is listed
+        println("  ", replace(strip(out), "\n" => " | "))
+    end
+
     @testset "port handling" begin
         using Sockets
         f1(x) = sin(abs(x))
