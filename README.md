@@ -6,9 +6,6 @@ The call tree becomes a nested, lazily-expanding list of callsites, next to a
 type-annotated source view where every expression shows its inferred type on
 hover and every call is a link you can descend into.
 
-Cthulhu itself is unmodified — this builds on its `AbstractProvider` interface
-and the same data path the terminal UI uses.
-
 ## Install
 
 ```julia
