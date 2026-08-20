@@ -170,10 +170,15 @@ Two more things worth knowing if you extend it:
   `set_config(cfg; inlay_types_vscode=true)` silently yields `false` and
   `cthulhu_typed` then passes `nothing` as the sink
   (`src/compiler/codeview.jl:120-122`), overriding your `IOContext`.
-- **Suppress `Core.Const` on callee names.** Every call's callee infers as
-  `Core.Const(sin)`; annotating it puts `::Core.Const(+)` on every operator.
-  `uninteresting_const` drops consts whose value is a `Function` or `Type` and
-  keeps genuinely interesting ones like `Core.Const(5)`.
+- **Suppress `Core.Const` on callee NAMES only.** Every call's callee infers as
+  `Core.Const(sin)`; annotating it puts `::Core.Const(+)` on every operator. But
+  the filter must be restricted to `Identifier` and dotted-access nodes: a
+  composite expression that happens to evaluate to a type is a real result, not
+  plumbing. `typeof(sqrt(real(zero(T))))` infers to `Core.Const(Float64)`, and
+  suppressing that left the call with no span at all — so it inherited the
+  enclosing expression's warning colour and looked type-unstable when it is not.
+  This is the same class of bug as the colour leak above: an expression with no
+  span of its own is at the mercy of its ancestors.
 
 ### Syntax highlighting
 

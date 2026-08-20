@@ -281,16 +281,22 @@ end
 The callee position of every call is inferred as `Core.Const(sin)` etc. Annotating
 it adds `::Core.Const(+)` to every operator, which is pure noise -- the name is
 already right there in the source. Cthulhu's own renderer suppresses these too
-(`is_callfunc` / `type_annotation_mode`, TypedSyntax/src/show.jl). Genuinely
-interesting constants (`Core.Const(5)`) are kept.
+(`is_callfunc` / `type_annotation_mode`, TypedSyntax/src/show.jl).
+
+Restricted to NAMES (`Identifier` and dotted access). A composite expression that
+happens to evaluate to a type or function is a real result, not plumbing:
+`typeof(sqrt(real(zero(T))))` infers to `Core.Const(Float64)`, and dropping its
+annotation left the call with no span at all, so it inherited the enclosing
+expression's warning colour and looked type-unstable when it is not.
 """
-uninteresting_const(@nospecialize(typ)) =
-    typ isa Core.Const && (typ.val isa Function || typ.val isa Type)
+uninteresting_const(@nospecialize(typ), node) =
+    typ isa Core.Const && (typ.val isa Function || typ.val isa Type) &&
+    kind(node) in (K"Identifier", K".")
 
 function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
                    cfg::CthulhuConfig, sparams::Dict{String,String})
     typ = node.typ
-    typ !== nothing && uninteresting_const(typ) && (typ = nothing)
+    typ !== nothing && uninteresting_const(typ, node) && (typ = nothing)
     nodeid = get(callsite_map, (fb, lb), 0)
     runtime = try is_runtime(node) catch; false end
 

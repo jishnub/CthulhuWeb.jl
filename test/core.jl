@@ -23,6 +23,9 @@ shim(x, n=2) = x^n + length(string(x))
 # keyword shim whose default value is itself a call, like sqrt_quasitriu's
 kwshim(v; width = eltype(v) <: Complex ? 512 : 256) = length(v) + width
 
+# a composite expression evaluating to a Type, inside an unstable expression
+constdemo(x) = (T = x > 0 ? Int64 : Float64; (rand(T), typeof(sqrt(zero(Float64)))))
+
 # a stable call nested inside an unstable expression
 leaky(x) = (T = x > 0 ? Int64 : Float64; rand(T) + length(string(x)))
 
@@ -337,6 +340,44 @@ end
     @test !occursin("var\"#", lbl)
     @test !occursin("typeof(", lbl)                   # plumbing arg dropped
     println("  link label: ", lbl)
+end
+
+@testset "composite Const results keep their annotation" begin
+    # `typeof(sqrt(zero(Float64)))` infers to Core.Const(Float64). Suppressing
+    # that (the filter exists to drop ::Core.Const(sin) from callee NAMES) left
+    # the call with no span, so it inherited the enclosing expression's warning
+    # colour and looked type-unstable. Reported against sqrt_quasitriu.
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    tmi = find_method_instance(provider, constdemo, Tuple{Float64})
+    s = Session(provider, tmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+
+    # the enclosing expression really is warning-coloured, else this proves nothing
+    @test occursin("s-union", html) || occursin("s-unstable", html)
+
+    # effective class of `typeof`: its own if it has one, else nearest ancestor
+    plain = replace(html, r"^.*?<pre class=\"code src\">"s=>"", r"</pre></div>.*$"s=>"")
+    stack = String[]; eff = String[]
+    for m in eachmatch(r"<span class=\"([^\"]*)\"[^>]*>|</span>|typeof", plain)
+        if m.match == "typeof"
+            i = findlast(c -> occursin("s-union",c) || occursin("s-unstable",c) ||
+                              occursin("s-stable",c), stack)
+            push!(eff, i === nothing ? "none" : stack[i])
+        elseif startswith(m.match, "</")
+            isempty(stack) || pop!(stack)
+        else
+            push!(stack, m.captures[1])
+        end
+    end
+    println("  typeof effective classes: ", eff)
+    @test !isempty(eff)
+    @test all(c -> occursin("s-stable", c), eff)          # never amber/red
+    @test !any(c -> occursin("s-union", c) || occursin("s-unstable", c), eff)
+
+    # ...while callee NAMES are still stripped of their Const noise
+    @test !occursin("Core.Const(sqrt)", html)
+    @test !occursin("Core.Const(rand)", html)
 end
 
 @testset "syntax highlighting" begin
