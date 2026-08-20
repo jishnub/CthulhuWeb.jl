@@ -170,15 +170,19 @@ Two more things worth knowing if you extend it:
   `set_config(cfg; inlay_types_vscode=true)` silently yields `false` and
   `cthulhu_typed` then passes `nothing` as the sink
   (`src/compiler/codeview.jl:120-122`), overriding your `IOContext`.
-- **Suppress `Core.Const` on callee NAMES only.** Every call's callee infers as
+- **Suppress `Core.Const` in callee POSITION only.** Every call's callee infers as
   `Core.Const(sin)`; annotating it puts `::Core.Const(+)` on every operator. But
-  the filter must be restricted to `Identifier` and dotted-access nodes: a
-  composite expression that happens to evaluate to a type is a real result, not
-  plumbing. `typeof(sqrt(real(zero(T))))` infers to `Core.Const(Float64)`, and
-  suppressing that left the call with no span at all — so it inherited the
-  enclosing expression's warning colour and looked type-unstable when it is not.
+  the filter must key on *position*, not on what the value happens to be.
+  `typeof(sqrt(real(zero(T))))` infers to `Core.Const(Float64)`, and so does the
+  variable `Tr` that stores it; suppressing those left them with no span at all,
+  so they inherited the enclosing expression's type — rendering amber, and
+  reporting the function's return type on hover. The callee is the first child of
+  a prefix call but the **second** child of an infix one (`a + b` parses as
+  `call(a, +, b)`), and the flag propagates through dotted access so
+  `Base.Math.sin` stays quiet to the leaf.
+
   This is the same class of bug as the colour leak above: an expression with no
-  span of its own is at the mercy of its ancestors.
+  span of its own is at the mercy of its ancestors, visually *and* on hover.
 
 ### Syntax highlighting
 

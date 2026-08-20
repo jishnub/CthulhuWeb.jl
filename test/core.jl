@@ -24,7 +24,11 @@ shim(x, n=2) = x^n + length(string(x))
 kwshim(v; width = eltype(v) <: Complex ? 512 : 256) = length(v) + width
 
 # a composite expression evaluating to a Type, inside an unstable expression
-constdemo(x) = (T = x > 0 ? Int64 : Float64; (rand(T), typeof(sqrt(zero(Float64)))))
+function constdemo(x)
+    T = x > 0 ? Int64 : Float64
+    Tr = typeof(sqrt(zero(Float64)))
+    return (rand(T), Tr)
+end
 
 # a stable call nested inside an unstable expression
 leaky(x) = (T = x > 0 ? Int64 : Float64; rand(T) + length(string(x)))
@@ -375,9 +379,24 @@ end
     @test all(c -> occursin("s-stable", c), eff)          # never amber/red
     @test !any(c -> occursin("s-union", c) || occursin("s-unstable", c), eff)
 
-    # ...while callee NAMES are still stripped of their Const noise
+    # ...while CALLEE names are still stripped of their Const noise
     @test !occursin("Core.Const(sqrt)", html)
     @test !occursin("Core.Const(rand)", html)
+    @test !occursin("Core.Const(typeof)", html)
+
+    # A variable bound to a constant type must carry its OWN annotation. It is an
+    # Identifier whose type is Core.Const(Float64), so a filter keyed on "is a
+    # name" ate it; hovering then reported the enclosing function's return type.
+    # `v` is a plain identifier, so no escaping needed -- keep the pattern simple
+    own(v) = collect(eachmatch(
+        Regex("<span class=\"[^\"]*\"(?: data-type=\"([^\"]*)\")?[^>]*>" * v * "</span>"),
+        html))
+    hits = own("Tr")
+    @test !isempty(hits)                              # Tr has a span at all
+    @test all(h -> h.captures[1] !== nothing, hits)   # ...carrying a type
+    @test all(h -> occursin("Float64", h.captures[1]), hits)
+    @test !any(h -> occursin("Union{", h.captures[1]), hits)   # not the ancestor's
+    println("  Tr annotated as: ", unique(h.captures[1] for h in hits))
 end
 
 @testset "syntax highlighting" begin
