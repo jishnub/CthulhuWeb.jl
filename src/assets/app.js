@@ -26,14 +26,19 @@ function connect() {
 
 function send(op, extra = {}) {
   const req = reqSeq++;
-  return new Promise((resolve) => {
+  const p = new Promise((resolve) => {
     pending.set(req, resolve);
     ws.send(JSON.stringify({ op, req, ...extra }));
   });
+  // Go busy the moment we send, NOT when the server acks. The first ack can be
+  // seconds late (cold compilation on both ends), which is precisely when the
+  // user most needs to see that something is happening.
+  refreshBusy();
+  return p;
 }
 
 function onMessage(msg) {
-  if (msg.op === "ack") { status("working…"); return; }
+  if (msg.op === "ack") { refreshBusy(); return; }
   if (msg.op === "init") {
     nodes.set(msg.root.id, msg.root);
     $("#root-sig").textContent = msg.root.name;
@@ -43,13 +48,30 @@ function onMessage(msg) {
     select(msg.root.id);
     return;
   }
-  if (msg.op === "error") { status("error"); showError(msg.msg); return; }
-  status("");
+  if (msg.op === "error") { pending.clear(); refreshBusy(); showError(msg.msg); return; }
   const resolve = msg.req != null ? pending.get(msg.req) : null;
   if (resolve) { pending.delete(msg.req); resolve(msg); }
+  refreshBusy();
+}
+
+// Busy state is derived from outstanding requests rather than set/cleared ad hoc,
+// so overlapping requests can't clear each other's indicator early.
+let busySince = 0;
+function refreshBusy() {
+  const busy = pending.size > 0;
+  document.body.classList.toggle("busy", busy);
+  if (busy) {
+    if (!busySince) busySince = Date.now();
+    $("#status").innerHTML = `<span class="spinner"></span>analysing…`;
+  } else {
+    busySince = 0;
+    $("#status").textContent = "";
+  }
 }
 
 // ---------------------------------------------------------------- tree
+
+const loadingNodes = new Set();
 
 async function toggleExpand(id, forceOpen = false) {
   const node = nodes.get(id);
@@ -57,11 +79,19 @@ async function toggleExpand(id, forceOpen = false) {
   if (expanded.has(id) && !forceOpen) { expanded.delete(id); renderTree(); return; }
 
   if (!childrenOf.has(id)) {
-    const res = await send("expand", { id });
-    if (res.error) showError(res.error);
-    const ids = [];
-    for (const rec of res.nodes || []) { nodes.set(rec.id, rec); ids.push(rec.id); }
-    childrenOf.set(id, ids);
+    // Show the spinner on the row that was actually clicked: inference for a
+    // cold callsite can take many seconds, and the header alone is easy to miss.
+    loadingNodes.add(id);
+    renderTree();
+    try {
+      const res = await send("expand", { id });
+      if (res.error) showError(res.error);
+      const ids = [];
+      for (const rec of res.nodes || []) { nodes.set(rec.id, rec); ids.push(rec.id); }
+      childrenOf.set(id, ids);
+    } finally {
+      loadingNodes.delete(id);
+    }
   }
   expanded.add(id);
   renderTree();
@@ -108,10 +138,15 @@ function renderNode(id) {
   row.className = "row" + (selected === id ? " selected" : "");
 
   const caret = document.createElement("span");
-  caret.className = "caret" + (n.expandable ? "" : " leaf") +
-                    (expanded.has(id) ? " open" : "");
-  caret.textContent = n.expandable ? "▸" : "·";
-  caret.onclick = (e) => { e.stopPropagation(); toggleExpand(id); };
+  if (loadingNodes.has(id)) {
+    caret.className = "caret";
+    caret.innerHTML = `<span class="spinner"></span>`;
+  } else {
+    caret.className = "caret" + (n.expandable ? "" : " leaf") +
+                      (expanded.has(id) ? " open" : "");
+    caret.textContent = n.expandable ? "▸" : "·";
+    caret.onclick = (e) => { e.stopPropagation(); toggleExpand(id); };
+  }
   row.appendChild(caret);
 
   const label = document.createElement("span");
@@ -139,10 +174,43 @@ function renderNode(id) {
 
 // ---------------------------------------------------------------- code pane
 
+// Inference and codegen happen on the server with no incremental progress to
+// report, so the honest thing is a spinner plus an escalating explanation: the
+// first descent is dominated by compiling Cthulhu's own inference paths and can
+// take tens of seconds, which otherwise reads as a hang.
+let hintTimers = [];
+function showLoading(what) {
+  hintTimers.forEach(clearTimeout);
+  hintTimers = [];
+  $("#code").innerHTML =
+    `<div class="loading"><span class="spinner big"></span>` +
+    `<div><div class="loading-main">${esc(what)}</div>` +
+    `<div class="loading-hint" id="loading-hint"></div></div></div>`;
+  const hint = $("#loading-hint");
+  const say = (ms, text) => hintTimers.push(setTimeout(() => { if (hint) hint.textContent = text; }, ms));
+  say(1500, "Running type inference…");
+  say(5000, "Still going — the first descent also compiles Cthulhu's inference code.");
+  say(15000, "Cold compilation can take a while on the first run. Later clicks are cached.");
+}
+function clearLoading() {
+  hintTimers.forEach(clearTimeout);
+  hintTimers = [];
+}
+
 async function select(id, cameFrom = 0) {
   selected = id;
   renderTree();
   renderCrumbs(id);
+  const n = nodes.get(id);
+  $("#code-title").textContent = n.name + (n.file ? `  —  ${n.file}:${n.line}` : "");
+  if (!n.descendable) {
+    clearLoading();
+    $("#code").innerHTML = `<p class="note">No code body: this is a <b>${esc(n.kind)}</b> callsite.</p>`;
+    return;
+  }
+  // Up before any awaiting, so the pane never sits blank while the tree expands.
+  showLoading("Analysing " + n.name + "…");
+
   // The server maps source spans onto child node ids, so the children must have
   // been materialised for those ids to mean anything on the client.
   const cfgView = document.querySelector("input[name=view]:checked");
@@ -150,14 +218,9 @@ async function select(id, cameFrom = 0) {
     const n0 = nodes.get(id);
     if (n0 && n0.expandable && !childrenOf.has(id)) await toggleExpand(id, true);
   }
-  const n = nodes.get(id);
-  $("#code-title").textContent = n.name + (n.file ? `  —  ${n.file}:${n.line}` : "");
-  if (!n.descendable) {
-    $("#code").innerHTML = `<p class="note">No code body: this is a <b>${esc(n.kind)}</b> callsite.</p>`;
-    return;
-  }
-  $("#code").innerHTML = `<p class="note">Loading…</p>`;
   const res = await send("body", { id });
+  clearLoading();
+  if (selected !== id) return;          // superseded by a later click
   $("#code").innerHTML = res.html || `<p class="err">no output</p>`;
   wireSourceSpans();
   // When ascending, mark the call we just came back from so "where was I?" is

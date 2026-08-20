@@ -224,3 +224,27 @@ body.show-warn .s-union    .tok-pun, body.show-warn .s-union    .tok-op {
 body.no-syntax .tok-kw, body.no-syntax .tok-com, body.no-syntax .tok-str,
 body.no-syntax .tok-num, body.no-syntax .tok-mac, body.no-syntax .tok-op,
 body.no-syntax .tok-pun { color: inherit; font-weight: inherit; font-style: normal; }
+
+/* ---- progress indication ----
+   Inference happens server-side with no incremental progress to report, so all
+   we can honestly show is "busy", sited where the user clicked. */
+.spinner {
+  display: inline-block; width: 9px; height: 9px; margin-right: 6px;
+  border: 1.5px solid var(--muted); border-top-color: transparent;
+  border-radius: 50%; animation: spin .6s linear infinite;
+  vertical-align: baseline;
+}
+.spinner.big { width: 15px; height: 15px; border-width: 2px; margin: 2px 10px 0 0; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#status .spinner { border-color: var(--accent); border-top-color: transparent; }
+
+.loading { display: flex; align-items: flex-start; color: var(--muted); }
+.loading-main { color: var(--fg); }
+.loading-hint { margin-top: 3px; font-size: 11px; opacity: .8; min-height: 1.4em; }
+
+/* The tree dims while a request is outstanding, but only after a beat: cached
+   clicks return in under a millisecond and would otherwise just flicker. */
+#tree { opacity: 1; transition: opacity .1s 0s; }
+body.busy #tree { opacity: .75; transition: opacity .1s .3s; }
+body.busy .caret:not(.leaf) { cursor: progress; }

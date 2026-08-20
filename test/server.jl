@@ -171,6 +171,38 @@ try
         @test_throws Exception HTTP.get("http://localhost:8766/"; retry=false)
     end
 
+    @testset "progress feedback" begin
+        # The UI shows a spinner from the moment it sends, but the server should
+        # still ack promptly and before the result, so a slow inference never
+        # looks like a dropped connection.
+        HTTP.WebSockets.open("ws://localhost:$PORT/") do ws
+            JSON3.read(first(ws))
+            HTTP.WebSockets.send(ws, JSON3.write(Dict("op"=>"expand","req"=>4242,"id"=>1)))
+            saw_ack = false
+            for raw in ws
+                m = JSON3.read(raw)
+                if get(m, :op, "") == "ack"
+                    @test m.req == 4242
+                    saw_ack = true
+                    continue
+                end
+                @test saw_ack            # ack must precede the result
+                @test m.op == "children"
+                break
+            end
+            @test saw_ack
+        end
+
+        # the client-side machinery the spinner depends on
+        js = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "app.js"), String)
+        css = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "style.css"), String)
+        @test occursin("refreshBusy", js)
+        @test occursin("loadingNodes", js)      # per-row spinner
+        @test occursin("showLoading", js)       # code-pane spinner
+        @test occursin("spinner", css)
+        @test occursin("@keyframes spin", css)
+    end
+
     @testset "port handling" begin
         using Sockets
         f1(x) = sin(abs(x))

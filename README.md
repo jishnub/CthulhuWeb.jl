@@ -178,6 +178,26 @@ The syntax palette is defined as its own set of CSS variables, disjoint from the
 type palette, so lexical colour can never be mistaken for a type signal. A
 **syntax** checkbox turns it off client-side.
 
+### Progress feedback
+
+Inference runs server-side with no incremental progress to report, so the UI
+shows *where* it is busy rather than a fake percentage: a spinner on the clicked
+row, a spinner in the code pane, and the tree dimming after a beat.
+
+Two details that matter:
+
+- **Busy state is set when the request is sent, not when the server acks.** The
+  client does not need permission to show a spinner, and tying it to the ack
+  makes the indicator hostage to round-trip latency.
+- **Dimming is delayed ~300 ms.** Cached clicks return in well under a
+  millisecond and would otherwise just flicker.
+
+The code pane escalates its explanation while waiting — "Running type
+inference…", then a note that the first descent also compiles Cthulhu's own
+inference code — because a cold first click takes seconds and silence reads as a
+hang. Measured on a small function: first expand ~0.6 s, subsequent cached
+requests ~0.3 ms.
+
 ### Ascending
 
 Descending is only half of navigation, so the code pane carries a **breadcrumb
