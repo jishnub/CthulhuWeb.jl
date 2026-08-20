@@ -154,7 +154,14 @@ produce.
 **Default-argument and keyword shims link their body method.** Such a method's
 body is a single forwarding call, so there is no source to annotate and nothing
 to click; the note carries a button to the body method, which is already a child
-in the tree.
+in the tree. Two wrinkles: a keyword shim also *computes its defaults*, so
+`sqrt_quasitriu(A0; blockwidth = eltype(A0) <: Complex ? 512 : 256)` has
+`eltype(A0)` among its children — `is_body_method` picks the real body (`f` with
+more arguments, or the gensym `#f#NN`) and ignores the rest, falling back to
+listing every descendable child if the heuristic misses. And the gensym name plus
+its `::typeof(f)` plumbing argument are cleaned up for display, so the button
+reads `sqrt_quasitriu(::Int64, ::UpperTriangular{…})` rather than
+`LinearAlgebra.var"#sqrt_quasitriu#80"(::Int64, ::typeof(…), …)`.
 
 Two more things worth knowing if you extend it:
 

@@ -115,22 +115,54 @@ function emit_code(io::IO, src, a::Int, b::Int, cm, offset::Int)
 end
 
 """
+Is `child` the body method of `parent`? Julia lowers `f(x, n=1)` to a shim `f(x)`
+calling `f(x, 1)`, and `f(x; kw=1)` to a shim calling a gensym `#f#NN`. Other
+children of a shim are default-value computations (`eltype(A0)` in
+`sqrt_quasitriu(A0; blockwidth = eltype(A0) <: Complex ? 512 : 256)`), which are
+not what "descend into the body method" means.
+"""
+function is_body_method(parent::Core.MethodInstance, child::Core.MethodInstance)
+    pd, cd = parent.def, child.def
+    (pd isa Method && cd isa Method) || return false
+    p, c = string(pd.name), string(cd.name)
+    return c == p || startswith(c, "#" * p * "#") || startswith(c, "##" * p * "#")
+end
+
+"""
+Readable label for a body-method button. Julia's keyword lowering produces names
+like `LinearAlgebra.var"#sqrt_quasitriu#80"` and threads the function itself
+through as a `::typeof(f)` argument; showing that verbatim is unreadable, so
+recover the plain name and drop the plumbing argument.
+"""
+function body_label(n::Node)
+    name = n.label.name
+    m = match(r"var\"#+([^#\"]+)#\d+\"$", name)
+    m === nothing || (name = String(m.captures[1]))
+    args = [a for a in n.label.argtypes if !startswith(a, "typeof(")]
+    args = [length(a) > 40 ? first(a, 37) * "…" : a for a in args]
+    return name * "(" * join(["::" * a for a in args], ", ") * ")"
+end
+
+"""
 Note shown for a method that only fills in default arguments (or forwards keyword
 arguments): its body is a single call to the real implementation, so there is no
 source to annotate and nothing to click. Link the body method explicitly --
 otherwise the pane is a dead end even though the tree does hold the child.
 """
-function truncated_note(s::Session, kids::Vector{Int})
-    targets = [k for k in kids if s.nodes[k].descendable]
+function truncated_note(s::Session, node::Node, kids::Vector{Int})
+    cand = [k for k in kids if s.nodes[k].descendable && s.nodes[k].mi !== nothing]
+    # prefer the real body method; fall back to every descendable child so the
+    # pane is never a dead end even when the heuristic misses
+    body = node.mi === nothing ? Int[] :
+           [k for k in cand if is_body_method(node.mi, s.nodes[k].mi)]
+    targets = isempty(body) ? cand : body
     if isempty(targets)
         return "<p class=\"note\">This method only fills in default arguments; " *
                "descend into the body method to see the full source.</p>"
     end
     links = join(map(targets) do k
-        l = s.nodes[k].label
-        sig = l.name * "(" * join(["::" * a for a in l.argtypes], ", ") * ")"
         "<button class=\"s-call bodylink\" data-node-id=\"$(k)\">" *
-        html_escape(sig) * "</button>"
+        html_escape(body_label(s.nodes[k])) * "</button>"
     end, " ")
     return "<p class=\"note\">This method only fills in default arguments. " *
            "Descend into the body method: " * links * "</p>"
@@ -158,11 +190,13 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     tsn === nothing && return nothing
 
     # Map source spans -> child node ids by position.
+    # Outside the try below: annotation is best-effort, but the truncated-source
+    # note needs the real child list regardless of whether annotation succeeds.
+    kids = expand!(s, node.id; optimize=false)
+
     callsite_map = Dict{Tuple{Int,Int},Int}()
-    kids = Int[]
     try
         callsites, sourcenodes = find_callsites(s.provider, result, node.ci, true)
-        kids = expand!(s, node.id; optimize=false)
         if length(kids) == length(callsites) == length(sourcenodes)
             for (i, sn) in enumerate(sourcenodes)
                 isa(sn, Callsite) && continue      # no source node for this callsite
@@ -203,7 +237,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     file = node.label.file === nothing ? "" :
         "<div class=\"srcfile\">" * html_escape(node.label.file) * "</div>"
-    note = truncated ? truncated_note(s, kids) : ""
+    note = truncated ? truncated_note(s, node, kids) : ""
 
     sp = isempty(sparams) ? "" :
         "<div class=\"sparams\">where " *

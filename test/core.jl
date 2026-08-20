@@ -5,7 +5,7 @@ using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
                 find_method_instance
 using CthulhuWeb
 # internals under test
-using CthulhuWeb: ESC, NodeId, ROOT_ID, Session, ansi_to_html, expand!,
+using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
                   source_html, static_params, token_classmap
 
@@ -19,6 +19,9 @@ tp_combine(p::TPBox{A,B}, q::A) where {A,B} = (p.a, q)
 # empty (it only forwards), which is what triggers the truncated source view.
 # NB `shim(x) = shim(x, 2)` would NOT do -- that body is a real call expression.
 shim(x, n=2) = x^n + length(string(x))
+
+# keyword shim whose default value is itself a call, like sqrt_quasitriu's
+kwshim(v; width = eltype(v) <: Complex ? 512 : 256) = length(v) + width
 
 # a stable call nested inside an unstable expression
 leaky(x) = (T = x > 0 ? Int64 : Float64; rand(T) + length(string(x)))
@@ -304,6 +307,36 @@ end
     @test target.descendable
     @test target.mi !== s.nodes[ROOT_ID].mi      # the body method, not itself
     println("shim links -> ", target.mi)
+end
+
+@testset "keyword shim links only the body method" begin
+    # `f(x; kw = <expr>)` lowers to a shim that BOTH computes the default and
+    # calls a gensym body `#f#NN`. The note must offer the body method, not the
+    # default-value computation (reported: `eltype(A0)` offered for
+    # `sqrt_quasitriu(A0; blockwidth = eltype(A0) <: Complex ? 512 : 256)`).
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    kmi = find_method_instance(provider, kwshim, Tuple{Vector{Float64}})
+    s = Session(provider, kmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+    @test occursin("only fills in default arguments", html)
+
+    kids = expand!(s, ROOT_ID; optimize=false)
+    names = [s.nodes[k].label.name for k in kids]
+    println("  shim children: ", names)
+    @test any(n -> occursin("eltype", n), names)      # the default-value call...
+    ids = [parse(Int, m.captures[1]) for m in eachmatch(r"data-node-id=\"(\d+)\"", html)]
+    @test length(ids) == 1                            # ...but only one link
+    linked = s.nodes[first(ids)]
+    @test !occursin("eltype", linked.label.name)      # and it is not that one
+    @test is_body_method(kmi, linked.mi)
+
+    # the gensym name is cleaned up for display
+    lbl = body_label(linked)
+    @test occursin("kwshim(", lbl)
+    @test !occursin("var\"#", lbl)
+    @test !occursin("typeof(", lbl)                   # plumbing arg dropped
+    println("  link label: ", lbl)
 end
 
 @testset "syntax highlighting" begin
