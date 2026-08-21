@@ -22,11 +22,11 @@ outside-in yields the same order (`f(...) where {T,S}` nests as
 `(Tuple{...} where S) where T`), so a plain `zip` lines them up.
 """
 function static_params(mi::Union{Nothing,Core.MethodInstance})
-    mi === nothing && return Pair{String,String}[]
+    mi === nothing && return Pair{String,Any}[]
     m = mi.def
-    m isa Method || return Pair{String,String}[]
+    m isa Method || return Pair{String,Any}[]
     vals = mi.sparam_vals
-    isempty(vals) && return Pair{String,String}[]
+    isempty(vals) && return Pair{String,Any}[]
     names = Symbol[]
     sig = m.sig
     while sig isa UnionAll
@@ -34,7 +34,9 @@ function static_params(mi::Union{Nothing,Core.MethodInstance})
         sig = sig.body
     end
     n = min(length(names), length(vals))
-    return [string(names[i]) => string(vals[i]) for i in 1:n]
+    # values, not strings: `T(x)` needs the binding to match `Type{Float64}` by
+    # identity, and the display can stringify at the point of use
+    return Pair{String,Any}[string(names[i]) => vals[i] for i in 1:n]
 end
 
 # ---------------------------------------------------------------------------
@@ -115,16 +117,146 @@ function emit_code(io::IO, src, a::Int, b::Int, cm, offset::Int)
 end
 
 """
+Byte range -> inferred type, for `pick_callsite` to compare a candidate's return
+type against the type of the expression its span denotes.
+
+**Outermost wins.** Nested nodes can share one range (`axes(B,1)[2:end]` is both
+the `ref` and its callee subtree), and the range denotes the whole expression, so
+the outer node's type is the one that says what the expression produces. Letting
+an inner node overwrite it sent `axes(B,1)[2:end]` to `lastindex` -- the `end`
+plumbing -- instead of `getindex`.
+
+Reading `.typ` off the `sourcenodes` entry instead is not an option either: not
+every entry is a `TypedSyntaxNode`. Cthulhu hands back plain `SyntaxNode`s for
+some callsites, which have no `.typ` field at all, and there is no reason the
+first callsite at a range should be the one that produced its value.
+"""
+function span_types!(d::Dict{Tuple{Int,Int},String}, node)
+    typ = node.typ
+    typ === nothing || get!(d, (first_byte(node), last_byte(node)), string(typ))
+    kids = children(node)
+    kids === nothing || for c in kids
+        span_types!(d, c)
+    end
+    return d
+end
+
+"""
+Which child of a call node is the callee. `f(x)` puts it first, `a + b` second
+(the tree is `call(a, +, b)`), `x'` last. Returns 0 when the node is not a call.
+
+One definition serves both the annotation suppression in `walk_source` and the
+name matching in `pick_callsite`: getting it wrong in the first put
+`::Core.Const(+)` back on every operator, and in the second it silently picks
+the wrong callsite to descend into.
+"""
+function callee_index(node)
+    k = kind(node)
+    (k === K"call" || k === K"dotcall") || return 0
+    kids = children(node)
+    (kids === nothing || isempty(kids)) && return 0
+    is_infix_op_call(node) && return 2
+    is_postfix_op_call(node) && return length(kids)
+    return 1
+end
+
+"""
+What the callee position resolved to, or `nothing` if it is not a constant.
+
+Inference already answers "which function is being called here" -- it is the
+`Core.Const` on the callee node, the same one `uninteresting_const` declines to
+print. Matching a candidate against *that* is exact, where matching against the
+callee's spelling is lossy in every direction: `a % b` is `rem`, `i \u2264 j` is `<=`,
+`T(x)` is `Type{Float64}`, `BoundsError(A, I)` is `Type{BoundsError}`, and
+`PCRE.exec_r_data(...)` is `Base.PCRE.exec_r_data`.
+
+`nothing` when the callee is computed (`(\$func)(x)`, `(h())(x)`) -- exactly the
+cases where the type tiebreak has to decide instead.
+"""
+function callee_value(node, src = nothing, sparams = nothing)
+    i = callee_index(node)
+    i == 0 && return nothing
+    kids = children(node)
+    (kids === nothing || i > length(kids)) && return nothing
+    c = kids[i]
+    if c isa TypedSyntax.TypedSyntaxNode
+        t = c.typ
+        t isa Core.Const && return t.val
+    end
+    # `T(x)` in a `where {T}` method: the callee is a static parameter, which
+    # carries no inferred type -- it is plain source text bound by the
+    # specialization. This is the same binding `open_span` shows on hover.
+    (src === nothing || sparams === nothing || !is_leaf(c)) && return nothing
+    return get(sparams, String(src[first_byte(c):last_byte(c)]), nothing)
+end
+
+"Does this candidate dispatch on `v`, the function the callee position resolved to?"
+function callee_matches(n::Node, @nospecialize(v))
+    ct = callsite_callee(n)
+    ct === nothing && return false
+    if v isa Type
+        # `Val(N)` is written with the UnionAll but dispatches on `Type{Val{N}}`
+        c = constructed_type(n)
+        return c !== nothing && c <: v
+    end
+    return ct === typeof(v)
+end
+
+"""
+The callee as written: `f` in `f(x)`, `+` in `a + b`, `gesdd!` in
+`LAPACK.gesdd!(x)`. `nothing` when the node is not a call or the callee is not a
+plain name -- `(\$func)(x)` and `(h())(x)` have none, which is exactly when the
+type tiebreak has to decide instead.
+
+Reading the leading identifier of the span text instead is what it replaces, and
+that is wrong in two common ways: it returns `p` for `p.x^2 + p.y^2`, and for
+`PCRE.exec_r_data(re.regex, str, idx-1, opts)` it returns the module qualifier
+`PCRE`, so the callsite that IS `Base.PCRE.exec_r_data` failed to match its own
+name and lost the range to destructuring plumbing.
+"""
+function callee_name(node, src)
+    i = callee_index(node)
+    i == 0 && return nothing
+    kids = children(node)
+    i <= length(kids) || return nothing
+    c = kids[i]
+    # `Mod.f(x)`: the callee is the dotted access; its name is the last component
+    while kind(c) === K"."
+        cc = children(c)
+        (cc === nothing || isempty(cc)) && return nothing
+        c = last(cc)
+    end
+    is_leaf(c) || return nothing
+    txt = strip(String(src[first_byte(c):last_byte(c)]))
+    return isempty(txt) ? nothing : String(txt)
+end
+
+"""
+The type of the function this callsite dispatches on, as written at the call.
+`nothing` when the callsite has no MethodInstance.
+
+Keyword calls are unwrapped: `f(x; kw=1)` dispatches as
+`kwcall(::NamedTuple, ::typeof(f), ::X)`, and the callee the source names is `f`.
+"""
+function callsite_callee(n::Node)
+    mi = n.mi
+    mi === nothing && return nothing
+    sig = Base.unwrap_unionall(mi.specTypes)
+    (sig isa DataType && !isempty(sig.parameters)) || return nothing
+    ps = sig.parameters
+    ps[1] === typeof(Core.kwcall) && length(ps) >= 3 && return ps[3]
+    return ps[1]
+end
+
+"""
 The type a constructor callsite constructs, or `nothing` for an ordinary call.
 Read off the callee -- `Val{2}()` specializes as `Tuple{Type{Val{2}}}` -- so
 `Float64[1,2]`, which is `getindex(::Type{Float64}, ...)`, is correctly not one.
 """
 function constructed_type(n::Node)
-    mi = n.mi
-    mi === nothing && return nothing
-    sig = Base.unwrap_unionall(mi.specTypes)
-    (sig isa DataType && !isempty(sig.parameters)) || return nothing
-    T = Base.unwrap_unionall(sig.parameters[1])
+    T = callsite_callee(n)
+    T === nothing && return nothing
+    T = Base.unwrap_unionall(T)
     (T isa DataType && T.name === Type.body.name && !isempty(T.parameters)) || return nothing
     return T.parameters[1]
 end
@@ -199,17 +331,27 @@ place. This is what separates the two callsites of
 attributed to the whole call. Its `Bool` does not match the span's `SVD{...}`,
 and the name heuristic cannot help because `(\$func)` has no name to match.
 """
-function pick_callsite(s::Session, cands::Vector{Int}, spantext::AbstractString,
-                       spantype::Union{Nothing,String})
+function pick_callsite(s::Session, cands::Vector{Int}, sn, src,
+                       spantype::Union{Nothing,String}, sparams::Dict{String,Any})
     length(cands) == 1 && return only(cands)
-    lead = match(r"^\s*([A-Za-z_][A-Za-z0-9_!]*)", spantext)
-    leadname = lead === nothing ? nothing : String(lead.captures[1])
+    # Prefer the callee as parsed; fall back to the leading identifier only for
+    # nodes that are not calls at all (`; kw=...`, a generator, an assignment),
+    # where there is no callee to read and any signal beats none.
+    leadname = callee_name(sn, src)
+    if leadname === nothing && callee_index(sn) == 0
+        lead = match(r"^\s*([A-Za-z_][A-Za-z0-9_!]*)",
+                     String(src[first_byte(sn):last_byte(sn)]))
+        leadname = lead === nothing ? nothing : String(lead.captures[1])
+    end
     # Lexicographic: the name/kind judgement first, the type match only as a
     # tiebreak, so a candidate named in the source is never overruled by one that
     # merely shares its return type.
     rtmatch(k) = spantype !== nothing && s.nodes[k].label.rt == spantype
+    calleeval = callee_value(sn, src, sparams)
     function score(k)
         n = s.nodes[k]
+        # Strongest: inference says this callsite IS the function named here.
+        calleeval === nothing || callee_matches(n, calleeval) && return 4
         ctor = constructed_type(n)
         # a constructor's label is `Type{Val{2}}`; compare against how the type
         # would be spelled in source instead
@@ -218,7 +360,10 @@ function pick_callsite(s::Session, cands::Vector{Int}, spantext::AbstractString,
            any(nm -> nm == leadname || endswith(nm, "." * leadname), names)
             return 3
         end
-        n.label.name == "Core.kwcall" && return 2
+        # The real dispatch for a keyword call. Tested on the wrapper, not the
+        # name: `signature_parts` rewrites the label to `f(...; kw)`, so
+        # `label.name == "Core.kwcall"` was never true.
+        :kw in n.label.wrappers && return 2
         # An unmatched constructor sharing a range with a real call is lowering
         # plumbing: `Pt2(a, a^2)` yields both `Type{Pt2}` and literal_pow's
         # `Type{Val{2}}`, and SSA order put `Val` first.
@@ -226,21 +371,6 @@ function pick_callsite(s::Session, cands::Vector{Int}, spantext::AbstractString,
         return 1
     end
     return cands[argmax([(score(k), rtmatch(k)) for k in cands])]
-end
-
-"""
-Byte range -> inferred type, for every annotated node in the tree. Built in one
-pass so `pick_callsite` can compare a candidate's return type against the type of
-the expression its span denotes.
-"""
-function span_types!(d::Dict{Tuple{Int,Int},String}, node)
-    typ = node.typ
-    typ === nothing || (d[(first_byte(node), last_byte(node))] = string(typ))
-    kids = children(node)
-    kids === nothing || for c in kids
-        span_types!(d, c)
-    end
-    return d
 end
 
 """
@@ -324,6 +454,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     # Outside the try below: annotation is best-effort, but the truncated-source
     # note needs the real child list regardless of whether annotation succeeds.
     kids = expand!(s, node.id; optimize=false)
+    sparams = Dict{String,Any}(static_params(node.mi))
 
     callsite_map = Dict{Tuple{Int,Int},Int}()
     try
@@ -333,17 +464,20 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
             # a NamedTuple construction *and* the call itself. Collect the
             # candidates and choose, rather than letting SSA order decide.
             cands = Dict{Tuple{Int,Int},Vector{Int}}()
+            spannode = Dict{Tuple{Int,Int},Any}()
             for (i, sn) in enumerate(sourcenodes)
                 isa(sn, Callsite) && continue      # no source node for this callsite
                 kn = s.nodes[kids[i]]
                 is_name_resolution(kn) && continue
                 is_synthetic_construct(kn, kind(sn)) && continue
-                push!(get!(cands, (first_byte(sn), last_byte(sn)), Int[]), kids[i])
+                key = (first_byte(sn), last_byte(sn))
+                get!(spannode, key, sn)
+                push!(get!(cands, key, Int[]), kids[i])
             end
             spantypes = span_types!(Dict{Tuple{Int,Int},String}(), tsn)
             for (key, ks) in cands
-                callsite_map[key] = pick_callsite(s, ks, String(tsn.source[key[1]:key[2]]),
-                                                  get(spantypes, key, nothing))
+                callsite_map[key] = pick_callsite(s, ks, spannode[key], tsn.source,
+                                                  get(spantypes, key, nothing), sparams)
             end
         end
     catch
@@ -364,7 +498,6 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     end
 
     src = tsn.source
-    sparams = Dict{String,String}(static_params(node.mi))
     startb = first_byte(tsn)
     cm = token_classmap(src, startb, idxend)
     io = IOBuffer()
@@ -381,8 +514,8 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     sp = isempty(sparams) ? "" :
         "<div class=\"sparams\">where " *
-        join(["<b>" * html_escape(k) * "</b> = " * html_escape(v)
-              for (k, v) in sort!(collect(sparams))], ", ") * "</div>"
+        join(["<b>" * html_escape(k) * "</b> = " * html_escape(string(v))
+              for (k, v) in sort!(collect(sparams), by=first)], ", ") * "</div>"
 
     return file * sp * note *
         "<div class=\"srcwrap\"><pre class=\"gutter\">" * gutter * "</pre>" *
@@ -393,7 +526,7 @@ end
 Returns the next byte position to emit. Ranges from a syntax tree nest properly
 by construction, so the spans can never overlap-without-containment."
 function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
-                     cfg::CthulhuConfig, sparams::Dict{String,String}, cm, offset::Int,
+                     cfg::CthulhuConfig, sparams::Dict{String,Any}, cm, offset::Int,
                      iscallee::Bool = false)
     fb, lb = first_byte(node), last_byte(node)
     fb > idxend && return pos
@@ -408,10 +541,7 @@ function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
     p = fb
     kids = children(node)
     if kids !== nothing
-        # The callee is the first child of a prefix call `f(x)`, but the SECOND
-        # child of an infix one -- `a + b` parses as call(a, +, b). Missing that
-        # put `::Core.Const(+)` back on every operator.
-        calleeidx = kind(node) === K"call" ? (is_infix_op_call(node) ? 2 : 1) : 0
+        calleeidx = callee_index(node)
         isdot = kind(node) === K"."
         for (i, c) in enumerate(kids)
             # a dotted callee passes the flag down, so `Base.Math.sin` stays quiet
@@ -449,7 +579,7 @@ uninteresting_const(@nospecialize(typ), iscallee::Bool) =
     (typ.val isa Function || typ.val isa Type || typ.val isa Module)
 
 function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
-                   cfg::CthulhuConfig, sparams::Dict{String,String}, iscallee::Bool)
+                   cfg::CthulhuConfig, sparams::Dict{String,Any}, iscallee::Bool)
     typ = node.typ
     # A callee whose annotation we deliberately drop is not an *untyped* node: it
     # must fall through to the enclosing call rather than raise a barrier.

@@ -27,7 +27,8 @@ using Cthulhu: AbstractProvider, CONFIG, Callsite, CthulhuConfig, CthulhuState,
                view_function
 # NB: `is_type_unstable` also exists in TypedSyntax; we want Cthulhu's.
 using JuliaSyntax: JuliaSyntax, @K_str, children, first_byte, is_infix_op_call,
-                   is_keyword, is_leaf, is_operator, kind, last_byte, source_line,
+                   is_keyword, is_leaf, is_operator, is_postfix_op_call, kind,
+                   last_byte, source_line,
                    tokenize
 using TypedSyntax: TypedSyntax, is_runtime
 using CodeTracking: CodeTracking

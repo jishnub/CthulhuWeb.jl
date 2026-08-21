@@ -4,10 +4,11 @@ using Cthulhu
 using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
                 find_method_instance
 using CthulhuWeb
-using JuliaSyntax: @K_str, first_byte, last_byte
+using JuliaSyntax: JuliaSyntax, @K_str, first_byte, last_byte
 # internals under test
 using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
+                  callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
                   source_html, static_params, token_classmap
 
@@ -54,6 +55,10 @@ function syndemo(x)
     s = "value=$y"
     return sin(y) + length(s)
 end
+
+# Callee spellings that all disagree with the callsite's label: `%` is `rem`,
+# `≤` is `<=`, and `T(n)` is `Type{Float64}`.
+spelled(x::T, n::Int) where {T<:AbstractFloat} = (n % UInt, x ≤ one(T), T(n))
 
 # A method whose callee is spelled by interpolation, as LinearAlgebra's
 # `($func)(A::AbstractTriangular; kwargs...) = ($func)(...; kwargs...)` is.
@@ -270,7 +275,7 @@ end
     # The reported case: descending into `+(x::T, y::T) where {T<:IEEEFloat}`.
     # The source text keeps the generic `T`, but this specialization binds it.
     pmi = find_method_instance(provider, +, Tuple{Float64,Float64})
-    @test static_params(pmi) == ["T" => "Float64"]
+    @test static_params(pmi) == ["T" => Float64]
 
     cfg = headless_config(CONFIG; view=:source, iswarn=true)
     s = Session(provider, pmi; config=cfg)
@@ -290,7 +295,7 @@ end
 
     # ordering with two parameters (declaration order, not reversed)
     cmi = find_method_instance(provider, tp_combine, Tuple{TPBox{Int,String},Int})
-    @test static_params(cmi) == ["A" => "Int64", "B" => "String"]
+    @test static_params(cmi) == ["A" => Int64, "B" => String]
 
     # methods with no `where` get no header
     smi = find_method_instance(provider, srcdemo, Tuple{Float64})
@@ -521,6 +526,47 @@ end
     @test !occursin("Core.Const", callee)     # `::Core.Const(Base.Math)` is noise
 end
 
+@testset "callees are matched on identity, not on spelling" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    smi = find_method_instance(provider, spelled, Tuple{Float64,Int})
+    s = Session(provider, smi; config=cfg)
+    byname = Dict(s.nodes[k].label.name => s.nodes[k]
+                  for k in expand!(s, ROOT_ID; optimize=false))
+
+    # what the source writes vs what the callsite is labelled
+    @test callee_matches(byname["rem"], (%))
+    @test callee_matches(byname["<="], (≤))
+    @test callee_matches(byname["Type{Float64}"], Float64)
+    @test !callee_matches(byname["rem"], (+))
+    @test !callee_matches(byname["Type{Float64}"], Int)
+    # the keyword wrapper is unwrapped, so `f(x; kw=1)` matches `f`
+    @test callsite_callee(byname["rem"]) === typeof(%)
+
+    # a constructor written through its UnionAll still matches: `Val(n)` is
+    # spelled `Val` but dispatches on `Type{Val{n}}`
+    p = Session(provider, find_method_instance(provider, powbody, Tuple{Float64});
+                config=cfg)
+    v = only(n for n in (p.nodes[k] for k in expand!(p, ROOT_ID; optimize=false))
+             if constructed_type(n) !== nothing)
+    @test callee_matches(v, Val)
+    @test !callee_matches(v, Base.RefValue)
+
+    # callee position: `f(x)` first, `a + b` second, `x'` last
+    tsn = first(Cthulhu.get_typed_sourcetext(smi, lookup_cached!(s, s.nodes[ROOT_ID], false).src,
+                                             lookup_cached!(s, s.nodes[ROOT_ID], false).rt))
+    seen = Set{Any}()
+    walk(nd) = (push!(seen, nd); ch = JuliaSyntax.children(nd);
+                ch === nothing || foreach(walk, ch))
+    walk(tsn)
+    # `n % UInt` is infix (callee is child 2), `T(n)` is prefix (child 1); getting
+    # that wrong is what put `::Core.Const(+)` on every operator.
+    sp = Dict{String,Any}(static_params(smi))
+    resolved = Set(callee_value(nd, tsn.source, sp) for nd in seen if callee_index(nd) != 0)
+    @test (%) in resolved
+    @test (≤) in resolved
+    @test Float64 in resolved   # `T(n)`: bound by the specialization, not inferred
+end
+
 @testset "an interpolated callee descends into the call, not the kwargs test" begin
     cfg = headless_config(CONFIG; view=:source, iswarn=true)
     fmi = find_method_instance(provider, kwforward, Tuple{Vector{Float64}})
@@ -557,6 +603,10 @@ end
     tys = CthulhuWeb.span_types!(Dict{Tuple{Int,Int},String}(), tsn)
     rng = first(k for (k, v) in ranges if "isempty" in v && "kwtarget" in v)
     @test get(tys, rng, nothing) == "Float64"
+    # ...and it is needed here precisely because `($fn)` resolves to no callee
+    node = first(x for x in sn if !(x isa Cthulhu.Callsite) &&
+                 (first_byte(x), last_byte(x)) == rng)
+    @test CthulhuWeb.callee_value(node) === nothing
 end
 
 @testset "lowering-invented constructors are not click targets" begin
