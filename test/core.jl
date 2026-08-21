@@ -4,10 +4,12 @@ using Cthulhu
 using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
                 find_method_instance
 using CthulhuWeb
+using JuliaSyntax: @K_str
 # internals under test
 using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
-                  is_name_resolution, source_html, static_params, token_classmap
+                  constructed_type, is_name_resolution, is_synthetic_construct,
+                  source_html, static_params, token_classmap
 
 f() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
 rec(n) = n <= 1 ? 1 : n * rec(n - 1)
@@ -52,6 +54,15 @@ function syndemo(x)
     s = "value=$y"
     return sin(y) + length(s)
 end
+
+# `x^n` with a literal exponent lowers to `literal_pow(^, x, Val(n))`. The
+# `Val{n}()` callsite has no call of its own to hang off, so it is attributed to
+# whatever encloses it -- here the entire method.
+powbody(x::Float64) = x^3
+
+struct Pt2D; x::Float64; y::Float64; end
+# ...and here it shares a source range with a constructor the user really wrote.
+ctor_and_pow(a::Float64) = Pt2D(a, a^2)
 
 # `Mod.f(x)` lowers to `getproperty(Mod, :f)` and then the call. The getproperty
 # callsite's source range is the callee *name*, so it used to swallow the click.
@@ -500,6 +511,39 @@ end
     @test !occursin("Core.Const", callee)     # `::Core.Const(Base.Math)` is noise
 end
 
+@testset "lowering-invented constructors are not click targets" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    linked(g, tt) = begin
+        s = Session(provider, find_method_instance(provider, g, tt); config=cfg)
+        html = source_html(s, s.nodes[ROOT_ID], cfg)
+        (s, html, [s.nodes[parse(Int, m.captures[1])]
+                   for m in eachmatch(r"data-node-id=\"(\d+)\"", something(html, ""))])
+    end
+
+    # `Val{3}()` is attributed to the whole of `powbody(x) = x^3`, so it used to
+    # be the only click target in the method -- every click landed in an empty
+    # singleton constructor.
+    s, html, ls = linked(powbody, Tuple{Float64})
+    @test html !== nothing
+    @test !any(n -> occursin("Val", n.label.name), ls)
+    # the callsite is still in the tree; it is only the source pane that filters
+    kids = expand!(s, ROOT_ID; optimize=false)
+    @test any(k -> constructed_type(s.nodes[k]) === Val{3}, kids)
+
+    # sharing a range with a real constructor, `Val` must lose
+    s, html, ls = linked(ctor_and_pow, Tuple{Float64})
+    @test html !== nothing
+    @test any(n -> n.label.name == "Type{Pt2D}", ls)   # what the user wrote...
+    @test !any(n -> occursin("Val", n.label.name), ls) # ...not what lowering added
+
+    # the discriminator is the source-node kind, so a constructor on a `call`
+    # node is kept whatever its name
+    pt = ls[findfirst(n -> n.label.name == "Type{Pt2D}", ls)]
+    @test constructed_type(pt) === Pt2D
+    @test !is_synthetic_construct(pt, K"call")
+    @test is_synthetic_construct(pt, K"=")
+end
+
 @testset "no type is reported where none is known" begin
     # Correctness principle: never attribute a type to something that has none.
     # Untyped COMPOSITE nodes emit an `.s-opaque` barrier that stops both the
@@ -573,6 +617,11 @@ end
     # Busy state must be raised on send, not on the server's ack: the first ack
     # can be seconds late, which is exactly when feedback matters.
     @test occursin(r"refreshBusy\(\);\s*\n\s*return p;", js)
+
+    # A non-descendable callsite (union split, runtime dispatch) has no body, but
+    # if it has alternatives the pane must offer them rather than dead-ending.
+    @test occursin(r"n\.expandable && !childrenOf\.has\(id\)", js)
+    @test occursin("Descend into one of its alternatives", js)
 end
 
 @testset "syntax highlighting" begin

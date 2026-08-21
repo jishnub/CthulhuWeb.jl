@@ -115,6 +115,50 @@ function emit_code(io::IO, src, a::Int, b::Int, cm, offset::Int)
 end
 
 """
+The type a constructor callsite constructs, or `nothing` for an ordinary call.
+Read off the callee -- `Val{2}()` specializes as `Tuple{Type{Val{2}}}` -- so
+`Float64[1,2]`, which is `getindex(::Type{Float64}, ...)`, is correctly not one.
+"""
+function constructed_type(n::Node)
+    mi = n.mi
+    mi === nothing && return nothing
+    sig = Base.unwrap_unionall(mi.specTypes)
+    (sig isa DataType && !isempty(sig.parameters)) || return nothing
+    T = Base.unwrap_unionall(sig.parameters[1])
+    (T isa DataType && T.name === Type.body.name && !isempty(T.parameters)) || return nothing
+    return T.parameters[1]
+end
+
+"""
+Names a constructed type may be written under in source. `Vector{Float64}` is
+`nameof`d `Array` but spelled `Vector`, so both spellings count.
+"""
+function ctor_names(@nospecialize(T))
+    out = String[]
+    m = match(r"^([A-Za-z_][A-Za-z0-9_!]*)", string(T))
+    m === nothing || push!(out, String(m.captures[1]))
+    t = Base.unwrap_unionall(T)
+    t isa DataType && push!(out, string(nameof(t)))
+    return out
+end
+
+"""
+Is this callsite a constructor that lowering invented rather than one the user
+wrote?
+
+`x^2` lowers to `Base.literal_pow(^, x, Val(2))`, and the `Val{2}()` callsite is
+attributed to whatever encloses it -- the assignment, or in `pow3(x) = x^3` the
+whole method. Descending there lands in an empty singleton constructor, and it
+was hijacking the click for the entire body. The same goes for the `NamedTuple`
+built for a keyword call, which is attributed to the `; kw=...` clause.
+
+A constructor the user actually wrote always has a `call` source node, so the
+node kind separates the two without guessing at names.
+"""
+is_synthetic_construct(n::Node, k) =
+    constructed_type(n) !== nothing && !(k === K"call" || k === K"dotcall")
+
+"""
 Is this callsite Julia resolving a qualified name rather than performing a call?
 
 `LAPACK.gesdd!(x)` lowers to `getproperty(LAPACK, :gesdd!)` and then the call, and
@@ -151,12 +195,20 @@ function pick_callsite(s::Session, cands::Vector{Int}, spantext::AbstractString)
     lead = match(r"^\s*([A-Za-z_][A-Za-z0-9_!]*)", spantext)
     leadname = lead === nothing ? nothing : String(lead.captures[1])
     function score(k)
-        nm = s.nodes[k].label.name
-        if leadname !== nothing && (nm == leadname || endswith(nm, "." * leadname))
+        n = s.nodes[k]
+        ctor = constructed_type(n)
+        # a constructor's label is `Type{Val{2}}`; compare against how the type
+        # would be spelled in source instead
+        names = ctor === nothing ? [n.label.name] : ctor_names(ctor)
+        if leadname !== nothing &&
+           any(nm -> nm == leadname || endswith(nm, "." * leadname), names)
             return 3
         end
-        nm == "Core.kwcall" && return 2
-        startswith(nm, "Type{NamedTuple") && return 0
+        n.label.name == "Core.kwcall" && return 2
+        # An unmatched constructor sharing a range with a real call is lowering
+        # plumbing: `Pt2(a, a^2)` yields both `Type{Pt2}` and literal_pow's
+        # `Type{Val{2}}`, and SSA order put `Val` first.
+        ctor === nothing || return 0
         return 1
     end
     return cands[argmax(map(score, cands))]
@@ -254,7 +306,9 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
             cands = Dict{Tuple{Int,Int},Vector{Int}}()
             for (i, sn) in enumerate(sourcenodes)
                 isa(sn, Callsite) && continue      # no source node for this callsite
-                is_name_resolution(s.nodes[kids[i]]) && continue
+                kn = s.nodes[kids[i]]
+                is_name_resolution(kn) && continue
+                is_synthetic_construct(kn, kind(sn)) && continue
                 push!(get!(cands, (first_byte(sn), last_byte(sn)), Int[]), kids[i])
             end
             for (key, ks) in cands

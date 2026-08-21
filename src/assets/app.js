@@ -219,8 +219,25 @@ async function select(id, cameFrom = 0) {
   const n = nodes.get(id);
   $("#code-title").textContent = n.name + (n.file ? `  —  ${n.file}:${n.line}` : "");
   if (!n.descendable) {
+    // A union-split callsite has no body of its own, but it does have
+    // alternatives -- and clicking it in the source pane used to dead-end here
+    // even though the tree could expand it. Offer the alternatives directly.
+    if (n.expandable && !childrenOf.has(id)) {
+      showLoading("Analysing " + n.name + "…");
+      await toggleExpand(id, true);
+      if (selected !== id) return;
+    }
     clearLoading();
-    $("#code").innerHTML = `<p class="note">No code body: this is a <b>${esc(n.kind)}</b> callsite.</p>`;
+    const alts = n.expandable ? (childrenOf.get(id) || []) : [];
+    const links = alts.map((k) => {
+      const c = nodes.get(k);
+      const pos = c.argtypes.map((t) => `::${esc(t)}`).join(", ");
+      return `<button class="s-call bodylink" data-node-id="${k}">${esc(c.name)}(${pos})</button>`;
+    }).join(" ");
+    $("#code").innerHTML =
+      `<p class="note">No code body: this is a <b>${esc(n.kind)}</b> callsite.` +
+      (links ? ` Descend into one of its alternatives: ${links}` : "") + `</p>`;
+    wireSourceSpans();
     return;
   }
   // Up before any awaiting, so the pane never sits blank while the tree expands.
