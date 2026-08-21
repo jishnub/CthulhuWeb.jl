@@ -4,13 +4,14 @@ using Cthulhu
 using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
                 find_method_instance
 using CthulhuWeb
+using LinearAlgebra: LinearAlgebra
 using JuliaSyntax: JuliaSyntax, @K_str, first_byte, last_byte
 # internals under test
 using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
-                  names_in_source, source_tokens,
+                  has_call, names_in_source, nothing_mapped, source_tokens,
                   source_html, static_params, token_classmap
 
 f() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
@@ -73,6 +74,32 @@ function multibyte(α::Float64, β::Float64)
     return sqrt(γ)
 end
 
+# Nested conditionals where the test folds: only one arm survives, and it is the
+# arms -- not just the conditions -- that should read as untaken.
+function armpick(v::Vector{Float64})
+    x = if eltype(v) === Float64
+        length(v)
+    elseif eltype(v) === Float32
+        length(v) + 1
+    else
+        0
+    end
+    return x
+end
+
+# ...but here the whole conditional folds to a constant, so NO arm carries types,
+# the arm that runs included. Nothing can be said about which way it went.
+function branchpick(v::Vector{Float64})
+    tag = if eltype(v) === Float64
+        :f64
+    elseif eltype(v) === Float32
+        :f32
+    else
+        :other
+    end
+    return (tag, length(v))
+end
+
 # A branch that folds away: for an `NTuple` argument the first test is const
 # `true`, so both `length(itr) > 32` and the fallthrough are compiled out.
 function deadbranch(itr::Tuple)
@@ -132,6 +159,26 @@ function span_content(html::AbstractString, id::Int)
         depth == 0 && return html[i:i + t.offset - 2]
     end
     return html[i:end]
+end
+
+"Plain text of each `.s-dead` region, in order -- what a reader sees faded."
+function dead_regions(html::AbstractString)
+    body = replace(html, r"^.*?<pre class=\"code src\">"s => "", r"</pre></div>.*$"s => "")
+    out, depth, at = String[], 0, -1
+    buf = IOBuffer()
+    for m in eachmatch(r"<span class=\"([^\"]*)\"[^>]*>|</span>|[^<]+", body)
+        t = m.match
+        if startswith(t, "<span")
+            depth += 1
+            at < 0 && occursin("s-dead", m.captures[1]) && (at = depth)
+        elseif startswith(t, "</")
+            depth == at && (push!(out, String(take!(buf))); at = -1)
+            depth -= 1
+        elseif at > 0
+            print(buf, t)
+        end
+    end
+    return out
 end
 
 provider = AbstractProvider(Base.Compiler.NativeInterpreter())
@@ -554,6 +601,60 @@ end
     callee = first(split(inner, "("))
     @test !occursin("s-opaque", callee)
     @test !occursin("Core.Const", callee)     # `::Core.Const(Base.Math)` is noise
+end
+
+@testset "an untaken branch greys whole, not just its condition" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    ami = find_method_instance(provider, armpick, Tuple{Vector{Float64}})
+    s = Session(provider, ami; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+    faded = join(dead_regions(html), "\n")
+
+    # the arms that cannot be reached, bodies and `elseif`/`else` included
+    @test occursin("length(v) + 1", faded)
+    @test occursin("0", faded)
+    @test occursin("Float32", faded)
+    # ...and the arm that is taken is at full strength
+    @test !occursin("=== Float64", faded)
+    # as is the code after the conditional
+    @test !occursin("return x", faded)
+
+    # A conditional that folds WHOLE says nothing about which arm ran: no arm
+    # carries types, so greying the untaken ones would grey the taken one too.
+    bmi = find_method_instance(provider, branchpick, Tuple{Vector{Float64}})
+    b = Session(provider, bmi; config=cfg)
+    bhtml = source_html(b, b.nodes[ROOT_ID], cfg)
+    @test bhtml !== nothing
+    bfaded = join(dead_regions(bhtml), "\n")
+    @test !occursin(":f64", bfaded)
+    @test !occursin(":f32", bfaded)     # ...and so neither is claimed dead
+end
+
+@testset "a body inference never annotated is explained, not greyed" begin
+    # `_chkstride1(ok::Bool, A, B...)` reached by semi-concrete evaluation has a
+    # known result and an IR that never maps back to source, so EVERY node in it
+    # is untyped -- which by the dead-code test would grey the whole method.
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    cmi = find_method_instance(provider, LinearAlgebra.chkstride1, Tuple{Matrix{Float64}})
+    @test cmi !== nothing
+    s = Session(provider, cmi; config=cfg)
+    kids = expand!(s, ROOT_ID; optimize=false)
+    i = findfirst(k -> s.nodes[k].label.kind in (:semiconcrete, :concrete, :constprop), kids)
+    @test i !== nothing
+    html = source_html(s, s.nodes[kids[i]], cfg)
+    @test html !== nothing
+    @test !occursin("s-dead", html)
+    @test occursin("evaluated this call at compile time", html)
+    @test occursin(s.nodes[kids[i]].label.rt, replace(html, r"<[^>]*>" => ""))
+
+    # `isempty(x::Tuple{}) = true` carries no types either, but there is nothing
+    # to explain about it -- the note is for bodies that make calls
+    ps(t) = JuliaSyntax.parsestmt(JuliaSyntax.SyntaxNode, t)
+    @test !has_call(ps("true"))
+    @test !has_call(ps("()"))
+    @test has_call(ps("f(g(x))"))
+    @test nothing_mapped(nothing)
 end
 
 @testset "callsites Cthulhu could not locate are named, not dropped" begin

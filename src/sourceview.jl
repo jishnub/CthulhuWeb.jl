@@ -203,7 +203,7 @@ function callee_matches(n::Node, @nospecialize(v))
 end
 
 """
-Was this call compiled out?
+Was this region compiled out?
 
 Inference produces no statement for unreachable code, so nothing in the subtree
 gets a type -- `_any_tuple(f, false, itr...)` in `any(f, itr::Tuple)` is entirely
@@ -211,29 +211,125 @@ untyped once `itr isa NTuple` folds to `true`, and so is the short-circuited
 `length(itr) > 32`. Live code always types something: a call has a return type,
 a variable has its own.
 
-Restricted to calls on purpose. A bare literal is untyped too (`32` has no type
-of its own), and so is a `where {T<:BlasFloat}` clause, neither of which is dead.
+Whole branches qualify, not just calls: in `_mul!`, `BlasFlag.SYRK` and the
+`elseif` reaching `BlasFlag.HERK` are entirely untyped while the `block` holding
+`BlasFlag.GEMM` is typed, so the taken branch is the one left at full strength.
+Marking only the calls greyed the conditions and left the bodies between them
+looking live.
+
+Restricted to a fixed set of kinds on purpose: a bare literal is untyped too
+(`32` has no type of its own), and so are a `where {T<:BlasFloat}` clause and
+every `::` annotation in a signature, none of which is dead.
 """
-function is_dead_call(node)
-    k = kind(node)
-    (k === K"call" || k === K"dotcall") || return false
+const DEAD_KINDS = (K"call", K"dotcall", K"block", K"if", K"elseif", K"||", K"&&",
+                    K".", K"return", K"for", K"while")
+
+function is_dead_region(node)
+    kind(node) in DEAD_KINDS || return false
     node.typ === nothing || return false
     return !has_typed_descendant(node)
 end
 
 """
-Byte ranges of the calls that were compiled out, outermost only: everything
-inside a dead call is dead too, and one span per region keeps the fade from
-stacking on itself.
+Nothing in the body carries a type -- which is not evidence that anything was
+compiled out.
+
+`_chkstride1(ok::Bool, A, B...) = _chkstride1(ok & (stride1(A) == 1), B...)`
+reached through semi-concrete evaluation has a known result
+(`Core.Const(true)`) and an IR that never maps back to the source, so every node
+in its body is untyped. Marking that unreachable is wrong twice over: nothing
+was compiled out, and by the same test everything was.
+
+Reachability is only a claim we can make about a body where inference DID map
+something -- there the untyped parts are the parts it did not reach. Where it
+mapped nothing, the honest answer is to annotate nothing and say why.
+"""
+nothing_mapped(body) = body === nothing || !has_typed_descendant(body)
+
+"""
+Is there work written here that annotating nothing would leave unexplained?
+
+`isempty(x::Tuple{}) = true` and `map(f, t::Tuple{}) = ()` also carry no types --
+a literal has none of its own -- but there is nothing to explain about them, and
+a note saying so is noise. The silence is only confusing where the source makes
+calls and none of them got annotated.
+"""
+function has_call(node)
+    k = kind(node)
+    (k === K"call" || k === K"dotcall") && return true
+    kids = children(node)
+    kids === nothing && return false
+    for c in kids
+        has_call(c) && return true
+    end
+    return false
+end
+
+"""
+Note for a body inference never annotated. Compile-time evaluation is the usual
+reason and worth naming, since the pane otherwise looks broken; for any other
+kind, say only what is observed.
+"""
+function unmapped_note(node::Node)
+    k = node.label.kind
+    if k === :concrete || k === :semiconcrete || k === :constprop
+        return "<p class=\"note\">Cthulhu evaluated this call at compile time (" *
+               html_escape(string(k)) * "), so no statement in the body carries " *
+               "its own type. The result is <code>" * html_escape(node.label.rt) *
+               "</code>.</p>"
+    end
+    return "<p class=\"note\">Inference mapped no statement in this body back to " *
+           "the source, so nothing here is annotated.</p>"
+end
+
+"Nodes whose children are consecutive statements or short-circuit operands --
+places where one child being untyped says something about the others."
+const REGION_PARENTS = (K"block", K"||", K"&&")
+
+"""
+The arms of a conditional: everything after the test.
+
+Only the arms say which way the branch went. The test does not: `eltype(v) ===
+Float64` mentions a typed `v` whether or not any arm ran, which is enough to make
+a naive sibling check believe the branch was resolved.
+"""
+conditional_arms(node) =
+    (k = children(node); k === nothing ? () : Iterators.drop(k, 1))
+
+"Did any arm of this conditional run? `elseif` nests another conditional, so recurse."
+arm_taken(node) = kind(node) === K"elseif" ?
+    any(arm_taken, conditional_arms(node)) : has_typed_descendant(node)
+
+"""
+Byte ranges of the regions that were compiled out.
+
+Outermost only: everything inside a dead region is dead too, and one span per
+region keeps the fade from stacking on itself and makes an untaken branch a
+single grey block rather than a scatter of grey fragments.
+
+**Only where a sibling is live.** "This was not taken" is a claim about a choice,
+and it needs the other side of the choice to be visible. When an `if` chain folds
+whole -- `if eltype(v) === Float64` on a `Vector{Float64}` -- *no* arm carries
+types, the arm that actually runs included, and greying them all would say the
+method does nothing. That is the same mistake as greying `_chkstride1`, one level
+down. The parent kind matters too: in `tag = if ...` the typed `tag` is the
+folded *result*, not evidence that any arm ran.
 """
 function collect_dead!(d::Set{Tuple{Int,Int}}, node)
-    if is_dead_call(node)
-        push!(d, (first_byte(node), last_byte(node)))
-        return d
-    end
     kids = children(node)
-    kids === nothing || for c in kids
-        collect_dead!(d, c)
+    kids === nothing && return d
+    k = kind(node)
+    live = if k === K"if" || k === K"elseif"
+        any(arm_taken, conditional_arms(node))
+    else
+        k in REGION_PARENTS && any(has_typed_descendant, kids)
+    end
+    for c in kids
+        if live && is_dead_region(c)
+            push!(d, (first_byte(c), last_byte(c)))
+        else
+            collect_dead!(d, c)
+        end
     end
     return d
 end
@@ -630,7 +726,8 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     # shim's own IR, which is an artefact of where the code lives, not evidence
     # that anything was compiled out.
     deadspans = Set{Tuple{Int,Int}}()
-    truncated || body === nothing || collect_dead!(deadspans, body)
+    unmapped = !truncated && nothing_mapped(body) && body !== nothing && has_call(body)
+    truncated || unmapped || collect_dead!(deadspans, body)
 
     src = tsn.source
     startb = first_byte(tsn)
@@ -646,7 +743,8 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     file = node.label.file === nothing ? "" :
         "<div class=\"srcfile\">" * html_escape(node.label.file) * "</div>"
-    note = truncated ? truncated_note(s, node, kids) : ""
+    note = truncated ? truncated_note(s, node, kids) :
+           unmapped  ? unmapped_note(node) : ""
 
     # A truncated shim already links its body method, and every other callsite it
     # has is lowering; listing them there would only repeat and clutter.
