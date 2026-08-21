@@ -380,17 +380,31 @@ function wireTooltips() {
       hotEl = el;
       hotEl.classList.add("hot");
       tipEl.textContent = el.dataset.type;
+      // Wrap at the source pane's width: a deeply parameterised type is one
+      // unbroken line otherwise, and a line wider than the screen cannot be
+      // read at all. Recomputed with the text since the pane is resizable.
+      tipEl.style.maxWidth = tipMaxWidth() + "px";
     }
     tipEl.classList.add("on");
     // clamp to the viewport so long Union{...} types stay readable
     const w = tipEl.offsetWidth, h = tipEl.offsetHeight;
     let x = e.clientX + 12, y = e.clientY - h - 8;
     if (x + w > window.innerWidth - 8) x = window.innerWidth - w - 8;
+    if (x < 4) x = 4;
     if (y < 4) y = e.clientY + 18;
+    // a wrapped tooltip can be tall enough to run off the bottom too
+    if (y + h > window.innerHeight - 4) y = Math.max(4, window.innerHeight - h - 4);
     tipEl.style.left = x + "px";
     tipEl.style.top = y + "px";
   };
   pane.onmouseleave = hideTip;
+}
+// Never wider than the source pane, never wider than the viewport, and never
+// so narrow that it wraps every couple of characters.
+function tipMaxWidth() {
+  const pane = $("#code-pane");
+  const paneW = pane ? pane.getBoundingClientRect().width : window.innerWidth;
+  return Math.max(240, Math.min(paneW - 16, window.innerWidth - 16));
 }
 function hideTip() {
   if (tipEl) tipEl.classList.remove("on");

@@ -172,7 +172,12 @@ body:not(.show-warn) .s-union { color: var(--fg); font-weight: 400; }
   position: fixed; z-index: 50; pointer-events: none;
   background: var(--fg); color: var(--bg);
   padding: 3px 8px; border-radius: 4px;
-  font: 11px/1.4 var(--mono); white-space: pre;
+  font: 11px/1.4 var(--mono);
+  /* Long `Union{...}` / `NamedTuple{...}` types are unreadable as one endless
+     line, so wrap instead of clipping. `pre-wrap` keeps any real newlines, and
+     `anywhere` lets a single unbroken type name break rather than overflow.
+     The max-width is set from the source pane's width in JS. */
+  white-space: pre-wrap; overflow-wrap: anywhere;
   box-shadow: 0 2px 10px rgba(0,0,0,.3);
   opacity: 0; transition: opacity .08s;
 }
