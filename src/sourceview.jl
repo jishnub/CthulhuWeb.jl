@@ -549,6 +549,10 @@ callsite dispatches on `typeof(adjoint!)`, which is the same identity match
 Searched in the body only -- a method's own signature is a `call` node whose
 callee is the method itself, and would tie with any recursive call.
 
+Assignment counts as a call: `B[j,i] = f(A[i,j])` in `transpose_f!` is a
+`setindex!` that Cthulhu locates nowhere and whose name the source never says,
+so it was invisible in the pane by both routes.
+
 Required unique in both directions: one unmapped call node whose callee is this
 function, and one unmapped callsite for that node. `_modify2x2!` under
 `@stable_muladdmul` has two callsites for its one node, so it stays unplaced --
@@ -558,14 +562,25 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
                           sparams::Dict{String,Any})
     isempty(unplaced) && return unplaced
     nodes = Any[]
+    unmapped(nd) = !haskey(callsite_map, (first_byte(nd), last_byte(nd)))
     function scan(nd)
         k = kind(nd)
-        if (k === K"call" || k === K"dotcall") &&
-           !haskey(callsite_map, (first_byte(nd), last_byte(nd)))
+        if (k === K"call" || k === K"dotcall") && unmapped(nd)
             v = callee_value(nd, src, sparams)
             v === nothing || push!(nodes, (v, nd))
         end
+        # Assignment is a call too, and one the source never names: `B[j,i] = v`
+        # is `setindex!`, `x.f = v` is `setproperty!`. Offer the target -- the
+        # `B[j,i]` -- rather than the whole statement, so the span does not
+        # swallow the right-hand side, which has calls of its own.
         kids = children(nd)
+        if k === K"=" && kids !== nothing && length(kids) == 2
+            lhs = kids[1]
+            fn = kind(lhs) === K"ref" ? setindex! :
+                 kind(lhs) === K"."   ? setproperty! : nothing
+            fn === nothing || unmapped(lhs) || (fn = nothing)
+            fn === nothing || push!(nodes, (fn, lhs))
+        end
         kids === nothing || foreach(scan, kids)
     end
     scan(tsn)
@@ -755,6 +770,7 @@ struct RenderCtx
     callsites::Dict{Tuple{Int,Int},NamedTuple}
     dead::Set{Tuple{Int,Int}}
     unverified::Set{Tuple{Int,Int}}
+    protocol::Set{Tuple{Int,Int}}
     sparams::Dict{String,Any}
     classmap::Vector{UInt8}
     offset::Int
@@ -897,6 +913,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     startb = first_byte(tsn)
     ctx = RenderCtx(src, callsite_map, deadspans,
                     collect_unverified!(Set{Tuple{Int,Int}}(), tsn, callsite_map, false),
+                    collect_protocol!(Set{Tuple{Int,Int}}(), tsn),
                     sparams, token_classmap(src, startb, idxend), startb, idxend)
     io = IOBuffer()
     walk_source(io, tsn, startb, ctx)
@@ -961,6 +978,31 @@ function walk_source(io::IO, node, pos::Int, ctx::RenderCtx, iscallee::Bool = fa
 
     opened && print(io, "</span>")
     return lb + 1
+end
+
+"""
+Is this node's inferred type the lowering's, rather than that of anything written
+in it?
+
+A `for` header is: its type is `iterate`'s return,
+`Union{Nothing, Tuple{Int64, Int64}}`, which is the type of neither the loop
+variable nor the iterable nor the header as an expression. In
+`transpose_f!`, the inner `i` has no type of its own, inherited the header's, and
+rendered amber -- reading as if the loop variable were type-unstable. The outer
+`j` happened to be typed, so the same two loops disagreed.
+
+The span stays (it is the `iterate` callsite, worth descending into); only the
+annotation goes.
+"""
+function collect_protocol!(d::Set{Tuple{Int,Int}}, node)
+    # The `=` / `in` child spans the same bytes as the header it sits in and gets
+    # the same callsite, so record the range rather than testing the kind.
+    kind(node) === K"iteration" && push!(d, (first_byte(node), last_byte(node)))
+    kids = children(node)
+    kids === nothing || for c in kids
+        collect_protocol!(d, c)
+    end
+    return d
 end
 
 """
@@ -1037,7 +1079,11 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
 
     classes = ["s"]
     issparam && push!(classes, "s-sparam")
-    if cs !== nothing
+    if (fb, lb) in ctx.protocol
+        # Keep the span (it is a callsite, and `iterate` is worth descending
+        # into) but report no type, so nothing inherits one that is not its own.
+        typ = nothing
+    elseif cs !== nothing
         # This span IS a call, so report the type Cthulhu inferred for that call.
         # The syntax node's own type comes from mapping IR statements onto source
         # ranges, and that mapping goes wrong: under `@stable_muladdmul` the call

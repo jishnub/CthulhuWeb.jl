@@ -60,6 +60,19 @@ function syndemo(x)
     return sin(y) + length(s)
 end
 
+# Nested loops with an indexed write. The `for` header's inferred type is
+# `iterate`'s `Union{Nothing, Tuple{...}}`, which belongs to neither the loop
+# variable nor the range; and `B[j,i] = ...` is a `setindex!` the source never
+# names and Cthulhu locates nowhere.
+function loopwrite(B::Matrix{Float64}, A::Matrix{Float64})
+    for j in axes(A, 2)
+        for i in axes(A, 1)
+            B[j, i] = A[i, j]
+        end
+    end
+    return B
+end
+
 # A callee held in a variable: the source never spells `sum`, so a name-based
 # test cannot find it -- but inference typed `g` as `Core.Const(sum)`.
 function viavariable(v::Vector{Float64})
@@ -727,6 +740,37 @@ end
 
     # calls Cthulhu DID place keep theirs, macro or not
     @test occursin(r"data-type=\"::[^\"]*\" data-node-id=", mhtml)
+end
+
+@testset "a loop header's type is the protocol's, not the variable's" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    lmi = find_method_instance(provider, loopwrite, Tuple{Matrix{Float64}, Matrix{Float64}})
+    s = Session(provider, lmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+    code = replace(html, r"^.*?<pre class=\"code src\">"s => "", r"</pre></div>.*$"s => "")
+
+    # `iterate` returns Union{Nothing, Tuple{...}}; a loop variable that has no
+    # type of its own inherited it and rendered amber, as if unstable.
+    @test !occursin("Union{Nothing", code)
+    @test !occursin("s-union", code)
+
+    # the header stays a click target -- `iterate` is worth descending into --
+    # it just carries no annotation
+    linked = [s.nodes[parse(Int, m.captures[1])].label.name
+              for m in eachmatch(r"data-node-id=\"(\d+)\"", code)]
+    @test "iterate" in linked
+    for m in eachmatch(r"<span class=\"([^\"]*)\"([^>]*)>", code)
+        occursin("s-call", m.captures[1]) || continue
+        # every annotated call span reports a real return type
+        t = match(r"data-type=\"::([^\"]*)\"", m.captures[2])
+        t === nothing || @test !startswith(t.captures[1], "Union{Nothing,")
+    end
+
+    # `B[j,i] = A[i,j]` is a setindex!: no call node in the source, no name in
+    # the text, but the assignment target is unambiguously where it goes
+    @test "setindex!" in linked
+    @test !occursin("note unlocated", html)
 end
 
 @testset "unlocated callsites are placed by callee, then named" begin
