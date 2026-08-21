@@ -565,9 +565,13 @@ end
     s = Session(provider, umi; config=cfg)
     html = source_html(s, s.nodes[ROOT_ID], cfg)
     @test html !== nothing
-    note = match(r"<p class=\"note unlocated\">.*?</p>"s, html)
+    note = match(r"<p class=\"note unlocated\">.*?</ul>"s, html)
     @test note !== nothing
     @test occursin("unlocatable_helper", note.match)
+    # one <li> per call, so several never run together into one wrapped blob
+    @test occursin("<ul class=\"unlocated-list\">", note.match)
+    @test length(collect(eachmatch(r"<li>", note.match))) ==
+          length(collect(eachmatch(r"data-node-id=", note.match)))
     # it is named with a working link, not merely mentioned
     id = match(r"data-node-id=\"(\d+)\"", note.match)
     @test id !== nothing

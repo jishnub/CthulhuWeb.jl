@@ -474,12 +474,16 @@ us -- keeps the pane honest and still reachable.
 """
 function unlocated_note(s::Session, ids::Vector{Int})
     isempty(ids) && return ""
-    links = join(map(ids) do k
-        "<button class=\"s-call bodylink\" data-node-id=\"$(k)\">" *
-        html_escape(body_label(s.nodes[k])) * "</button>"
-    end, " ")
+    # A list, not a run of buttons: these are separate calls, and the signatures
+    # are long enough that side by side they read as one wrapped blob.
+    items = join(map(ids) do k
+        "<li><button class=\"s-call bodylink\" data-node-id=\"$(k)\">" *
+        html_escape(body_label(s.nodes[k])) * "</button></li>"
+    end)
+    what = length(ids) == 1 ? "it" : "these"
     return "<p class=\"note unlocated\">Also called here, but Cthulhu could not " *
-           "locate it in the source: " * links * "</p>"
+           "locate " * what * " in the source:</p>" *
+           "<ul class=\"unlocated-list\">" * items * "</ul>"
 end
 
 """
