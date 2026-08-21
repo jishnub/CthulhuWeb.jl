@@ -217,9 +217,10 @@ Whole branches qualify, not just calls: in `_mul!`, `BlasFlag.SYRK` and the
 Marking only the calls greyed the conditions and left the bodies between them
 looking live.
 
-Restricted to a fixed set of kinds on purpose: a bare literal is untyped too
-(`32` has no type of its own), and so are a `where {T<:BlasFloat}` clause and
-every `::` annotation in a signature, none of which is dead.
+Restricted to a fixed set of kinds on purpose -- a `where {T<:BlasFloat}` clause
+and every `::` annotation in a signature are untyped without being dead -- and to
+regions that hold something typeable at all, since a literal carries no type
+whether it runs or not.
 """
 const DEAD_KINDS = (K"call", K"dotcall", K"block", K"if", K"elseif", K"||", K"&&",
                     K".", K"return", K"for", K"while")
@@ -227,7 +228,28 @@ const DEAD_KINDS = (K"call", K"dotcall", K"block", K"if", K"elseif", K"||", K"&&
 function is_dead_region(node)
     kind(node) in DEAD_KINDS || return false
     node.typ === nothing || return false
+    has_typeable(node) || return false
     return !has_typed_descendant(node)
+end
+
+"""
+Does this region contain anything that WOULD carry a type if it ran?
+
+A literal never does. `return true` in `matmul2x2or3x3_nonzeroalpha!` is untyped
+in exactly the way an unreachable statement is, so greying it claimed a `return`
+on the taken path had been compiled out. Identifiers and calls do get types when
+they run, so a region holding one is a region there is evidence about; a region
+of pure literals is one we know nothing about either way.
+"""
+function has_typeable(node)
+    k = kind(node)
+    (k === K"Identifier" || k === K"call" || k === K"dotcall") && return true
+    kids = children(node)
+    kids === nothing && return false
+    for c in kids
+        has_typeable(c) && return true
+    end
+    return false
 end
 
 """

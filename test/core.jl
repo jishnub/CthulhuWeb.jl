@@ -11,7 +11,8 @@ using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ans
                   headless_config, lookup_cached!, node_record, render_body,
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
-                  has_call, names_in_source, nothing_mapped, source_tokens,
+                  has_call, has_typeable, names_in_source, nothing_mapped,
+                  source_tokens,
                   unique_callsites,
                   source_html, static_params, token_classmap
 
@@ -86,6 +87,16 @@ function armpick(v::Vector{Float64})
         0
     end
     return x
+end
+
+# `return true` is untyped -- a literal has no type of its own -- and sits among
+# typed statements, which is the shape of an unreachable statement.
+function literalreturn(v::Vector{Float64})
+    if length(v) > 2
+        sum(v)
+        return true
+    end
+    return false
 end
 
 # ...but here the whole conditional folds to a constant, so NO arm carries types,
@@ -630,6 +641,21 @@ end
     bfaded = join(dead_regions(bhtml), "\n")
     @test !occursin(":f64", bfaded)
     @test !occursin(":f32", bfaded)     # ...and so neither is claimed dead
+
+    # A literal carries no type whether it runs or not, so `return true` on the
+    # taken path is untyped in exactly the way an unreachable statement is.
+    # Claiming it was compiled out is the one thing this view must never do.
+    ps(t) = JuliaSyntax.parsestmt(JuliaSyntax.SyntaxNode, t)
+    @test !has_typeable(ps("return true"))
+    @test !has_typeable(ps("(1, 2)"))
+    @test has_typeable(ps("return x"))
+    @test has_typeable(ps("return f(1)"))
+
+    lmi = find_method_instance(provider, literalreturn, Tuple{Vector{Float64}})
+    l = Session(provider, lmi; config=cfg)
+    lhtml = source_html(l, l.nodes[ROOT_ID], cfg)
+    @test lhtml !== nothing
+    @test !occursin("return true", join(dead_regions(lhtml), "\n"))
 end
 
 @testset "a body inference never annotated is explained, not greyed" begin
