@@ -345,7 +345,12 @@ function wireSourceSpans() {
   legend.className = "srclegend";
   legend.innerHTML = "Hover any expression (or a <b>where</b> parameter) for its type · " +
     "click a <b>call</b> to descend · " +
-    "<b class=\"k-u\">red</b> = type-unstable, <b class=\"k-n\">amber</b> = small union";
+    "<b class=\"k-u\">red</b> = type-unstable, <b class=\"k-n\">amber</b> = small union" +
+    // only mentioned when the page actually has some -- an unexplained legend
+    // entry is worse than none
+    (document.querySelector("#code .s-dead")
+      ? ", <span class=\"s-dead\">faded</span> = compiled out for these argument types"
+      : "");
   $("#code").appendChild(legend);
 }
 

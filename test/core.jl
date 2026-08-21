@@ -56,6 +56,19 @@ function syndemo(x)
     return sin(y) + length(s)
 end
 
+# A branch that folds away: for an `NTuple` argument the first test is const
+# `true`, so both `length(itr) > 32` and the fallthrough are compiled out.
+function deadbranch(itr::Tuple)
+    if itr isa NTuple || length(itr) > 32
+        return sum(itr)
+    end
+    prod(itr)
+end
+
+# A one-line method whose body is a leaf -- but a real one, not a shim with an
+# emptied body. Truncating this to its signature hid the whole method.
+passthru(x::Vector{Float64}) = x
+
 # Callee spellings that all disagree with the callsite's label: `%` is `rem`,
 # `≤` is `<=`, and `T(n)` is `Type{Float64}`.
 spelled(x::T, n::Int) where {T<:AbstractFloat} = (n % UInt, x ≤ one(T), T(n))
@@ -524,6 +537,58 @@ end
     callee = first(split(inner, "("))
     @test !occursin("s-opaque", callee)
     @test !occursin("Core.Const", callee)     # `::Core.Const(Base.Math)` is noise
+end
+
+@testset "code compiled out is greyed, not silently normal" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    dmi = find_method_instance(provider, deadbranch, Tuple{Tuple{Int,Int}})
+    s = Session(provider, dmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+    @test occursin("s-dead", html)
+    # the unreachable call is faded...
+    dead = match(r"<span class=\"s s-dead\"[^>]*>((?:(?!</span>).)*)", html)
+    @test dead !== nothing
+    @test occursin("unreachable", html)
+    # ...and the reachable one is still a live click target
+    live = [s.nodes[parse(Int, m.captures[1])].label.name
+            for m in eachmatch(r"data-node-id=\"(\d+)\"", html)]
+    @test "sum" in live
+    @test !("prod" in live)
+    # only the OUTERMOST dead call gets a span: `length(itr) > 32` contains
+    # `length(itr)`, and nesting the fade would multiply the opacities
+    @test !occursin(r"s-dead(?:(?!</span>).)*s-dead"s, html)
+
+    # the legend explains the fade, but only on pages that have any
+    js = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "app.js"), String)
+    @test occursin("#code .s-dead", js)
+    @test occursin("compiled out for these argument types", js)
+
+    # a signature default is untyped in a shim's own IR without being dead
+    kmi = find_method_instance(provider, kwshim, Tuple{Vector{Float64}})
+    k = Session(provider, kmi; config=cfg)
+    khtml = source_html(k, k.nodes[ROOT_ID], cfg)
+    @test !occursin("s-dead", khtml)
+end
+
+@testset "a real one-line method is not mistaken for a shim" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    pmi = find_method_instance(provider, passthru, Tuple{Vector{Float64}})
+    s = Session(provider, pmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+    # the body is shown, not cut back to the signature...
+    body = replace(html, r"^.*?<pre class=\"code src\">"s => "", r"</pre></div>.*$"s => "")
+    @test occursin("=", replace(body, r"<[^>]*>" => ""))
+    @test endswith(strip(replace(body, r"<[^>]*>" => "")), "= x")
+    # ...and there is no default-argument caption
+    @test !occursin("only fills in default arguments", html)
+
+    # the genuine shim still truncates and still explains itself
+    smi = find_method_instance(provider, shim, Tuple{Int})
+    s2 = Session(provider, smi; config=cfg)
+    h2 = source_html(s2, s2.nodes[ROOT_ID], cfg)
+    @test occursin("only fills in default arguments", h2)
 end
 
 @testset "callees are matched on identity, not on spelling" begin

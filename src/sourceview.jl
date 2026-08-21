@@ -203,6 +203,52 @@ function callee_matches(n::Node, @nospecialize(v))
 end
 
 """
+Was this call compiled out?
+
+Inference produces no statement for unreachable code, so nothing in the subtree
+gets a type -- `_any_tuple(f, false, itr...)` in `any(f, itr::Tuple)` is entirely
+untyped once `itr isa NTuple` folds to `true`, and so is the short-circuited
+`length(itr) > 32`. Live code always types something: a call has a return type,
+a variable has its own.
+
+Restricted to calls on purpose. A bare literal is untyped too (`32` has no type
+of its own), and so is a `where {T<:BlasFloat}` clause, neither of which is dead.
+"""
+function is_dead_call(node)
+    k = kind(node)
+    (k === K"call" || k === K"dotcall") || return false
+    node.typ === nothing || return false
+    return !has_typed_descendant(node)
+end
+
+"""
+Byte ranges of the calls that were compiled out, outermost only: everything
+inside a dead call is dead too, and one span per region keeps the fade from
+stacking on itself.
+"""
+function collect_dead!(d::Set{Tuple{Int,Int}}, node)
+    if is_dead_call(node)
+        push!(d, (first_byte(node), last_byte(node)))
+        return d
+    end
+    kids = children(node)
+    kids === nothing || for c in kids
+        collect_dead!(d, c)
+    end
+    return d
+end
+
+function has_typed_descendant(node)
+    node.typ === nothing || return true
+    kids = children(node)
+    kids === nothing && return false
+    for c in kids
+        has_typed_descendant(c) && return true
+    end
+    return false
+end
+
+"""
 The callee as written: `f` in `f(x)`, `+` in `a + b`, `gesdd!` in
 `LAPACK.gesdd!(x)`. `nothing` when the node is not a call or the callee is not a
 plain name -- `(\$func)(x)` and `(h())(x)` have none, which is exactly when the
@@ -418,8 +464,10 @@ function truncated_note(s::Session, node::Node, kids::Vector{Int})
            [k for k in cand if is_body_method(node.mi, s.nodes[k].mi)]
     targets = isempty(body) ? cand : body
     if isempty(targets)
-        return "<p class=\"note\">This method only fills in default arguments; " *
-               "descend into the body method to see the full source.</p>"
+        # Say what actually happened rather than pointing at a body method that
+        # is not there: from here the user has nowhere to click and no reason.
+        return "<p class=\"note\">This method only fills in default arguments, " *
+               "and Cthulhu found no call here to descend into.</p>"
     end
     links = join(map(targets) do k
         "<button class=\"s-call bodylink\" data-node-id=\"$(k)\">" *
@@ -486,22 +534,39 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     # Mirrors cthulhu_typed (codeview.jl:110-118): a method that only fills in
     # default arguments has an empty body, so stop after the signature.
+    #
+    # Upstream tests `is_leaf(body)` alone, and its own comment says why -- "we
+    # empty the body when filling kwargs". But a real one-line method has a leaf
+    # body too: `_unwrap(A::AbstractVecOrMat) = A` was being cut back to its
+    # signature and captioned as a default-argument shim.
+    #
+    # "Emptied" is literal, and that is the test: the emptied body spans no bytes
+    # at all (`56:55`), where `= A` spans the one byte `A` sits on.
     kids_tsn = children(tsn)
     idxend = lastindex(tsn.source)
     truncated = false
+    body = nothing
     if kids_tsn !== nothing && length(kids_tsn) == 2
         sig, body = kids_tsn
-        if is_leaf(body)
+        if is_leaf(body) && last_byte(body) < first_byte(body)
             idxend = last_byte(sig)
             truncated = true
         end
     end
 
+    # Dead-code marking applies to the body only. A signature default like
+    # `kwshim(v; width = eltype(v) <: Complex ? 512 : 256)` is untyped in the
+    # shim's own IR, which is an artefact of where the code lives, not evidence
+    # that anything was compiled out.
+    deadspans = Set{Tuple{Int,Int}}()
+    truncated || body === nothing || collect_dead!(deadspans, body)
+
     src = tsn.source
     startb = first_byte(tsn)
     cm = token_classmap(src, startb, idxend)
     io = IOBuffer()
-    walk_source(io, tsn, startb, src, callsite_map, idxend, cfg, sparams, cm, startb)
+    walk_source(io, tsn, startb, src, callsite_map, idxend, cfg, sparams, cm, startb,
+                deadspans)
     code = String(take!(io))
 
     firstline = source_line(src, first_byte(tsn))
@@ -527,6 +592,7 @@ Returns the next byte position to emit. Ranges from a syntax tree nest properly
 by construction, so the spans can never overlap-without-containment."
 function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
                      cfg::CthulhuConfig, sparams::Dict{String,Any}, cm, offset::Int,
+                     deadspans::Set{Tuple{Int,Int}},
                      iscallee::Bool = false)
     fb, lb = first_byte(node), last_byte(node)
     fb > idxend && return pos
@@ -536,7 +602,7 @@ function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
     # text between the previous sibling and this node (whitespace, operators, ...)
     pos < fb && emit_code(io, src, pos, fb - 1, cm, offset)
 
-    opened = open_span(io, node, fb, lb, src, callsite_map, cfg, sparams, iscallee)
+    opened = open_span(io, node, fb, lb, src, callsite_map, cfg, sparams, deadspans, iscallee)
 
     p = fb
     kids = children(node)
@@ -548,7 +614,7 @@ function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
             # all the way to the leaf
             childcallee = (i == calleeidx) || (iscallee && isdot)
             p = walk_source(io, c, p, src, callsite_map, idxend, cfg, sparams, cm,
-                            offset, childcallee)
+                            offset, deadspans, childcallee)
         end
     end
     p <= lb && emit_code(io, src, p, lb, cm, offset)
@@ -579,7 +645,8 @@ uninteresting_const(@nospecialize(typ), iscallee::Bool) =
     (typ.val isa Function || typ.val isa Type || typ.val isa Module)
 
 function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
-                   cfg::CthulhuConfig, sparams::Dict{String,Any}, iscallee::Bool)
+                   cfg::CthulhuConfig, sparams::Dict{String,Any},
+                   deadspans::Set{Tuple{Int,Int}}, iscallee::Bool)
     typ = node.typ
     # A callee whose annotation we deliberately drop is not an *untyped* node: it
     # must fall through to the enclosing call rather than raise a barrier.
@@ -597,6 +664,14 @@ function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
             typ = val
             issparam = true
         end
+    end
+
+    if (fb, lb) in deadspans
+        # Grey the whole subtree, and say why on hover -- an unexplained grey
+        # block reads as a rendering failure.
+        print(io, "<span class=\"s s-dead\" data-type=\"",
+              "unreachable: compiled out for these argument types\">")
+        return true
     end
 
     if typ === nothing && nodeid == 0 && !runtime

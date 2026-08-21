@@ -274,3 +274,9 @@ body.busy .caret:not(.leaf) { cursor: progress; }
    colour from a distant typed ancestor. No other styling -- it exists to be a
    boundary. */
 .s-opaque { color: var(--fg); font-weight: 400; }
+
+/* Code inference never reached, because a branch folded away for these argument
+   types. Faded with `opacity` rather than a colour so the token highlighting
+   inside it fades too -- recolouring the parent would leave the keywords and
+   strings underneath at full strength. */
+.s-dead { color: var(--fg); font-weight: 400; opacity: .4; font-style: italic; }
