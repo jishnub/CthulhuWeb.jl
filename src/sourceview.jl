@@ -115,6 +115,28 @@ function emit_code(io::IO, src, a::Int, b::Int, cm, offset::Int)
 end
 
 """
+Is this callsite Julia resolving a qualified name rather than performing a call?
+
+`LAPACK.gesdd!(x)` lowers to `getproperty(LAPACK, :gesdd!)` and then the call, and
+the `getproperty` callsite's source range is the callee *name* -- the most natural
+place to click. Descending there lands in `getproperty(x::Module, f::Symbol) =
+getglobal(x, f)`, which is name resolution, not the function that was clicked.
+Dropping it from the click map lets the click reach the enclosing call span.
+
+Only `Module` receivers qualify: `obj.field` on a struct is real property access
+and stays clickable.
+"""
+function is_name_resolution(n::Node)
+    mi = n.mi
+    mi === nothing && return false
+    sig = Base.unwrap_unionall(mi.specTypes)
+    sig isa DataType || return false
+    ps = sig.parameters
+    return length(ps) == 3 && ps[1] === typeof(getproperty) &&
+           ps[2] === Module && ps[3] === Symbol
+end
+
+"""
 Choose which callsite a source range should descend into when several share it.
 
 `eigen!(x; permute, scale, sortby)` produces a `NamedTuple` construction as well
@@ -232,6 +254,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
             cands = Dict{Tuple{Int,Int},Vector{Int}}()
             for (i, sn) in enumerate(sourcenodes)
                 isa(sn, Callsite) && continue      # no source node for this callsite
+                is_name_resolution(s.nodes[kids[i]]) && continue
                 push!(get!(cands, (first_byte(sn), last_byte(sn)), Int[]), kids[i])
             end
             for (key, ks) in cands
@@ -331,14 +354,22 @@ information: `typeof(...)` infers to `Core.Const(Float64)`, and so does the
 variable `Tr` that stores it. Dropping those annotations left them with no span
 at all, so they inherited the enclosing expression's type -- rendering amber, and
 reporting the function's return type on hover.
+
+`Module` is included for the same reason: in `LAPACK.gesdd!(x)` the qualifier is
+part of the name being called, and `::Core.Const(LinearAlgebra.LAPACK)` says
+nothing the source does not.
 """
 uninteresting_const(@nospecialize(typ), iscallee::Bool) =
-    iscallee && typ isa Core.Const && (typ.val isa Function || typ.val isa Type)
+    iscallee && typ isa Core.Const &&
+    (typ.val isa Function || typ.val isa Type || typ.val isa Module)
 
 function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
                    cfg::CthulhuConfig, sparams::Dict{String,String}, iscallee::Bool)
     typ = node.typ
-    typ !== nothing && uninteresting_const(typ, iscallee) && (typ = nothing)
+    # A callee whose annotation we deliberately drop is not an *untyped* node: it
+    # must fall through to the enclosing call rather than raise a barrier.
+    suppressed = typ !== nothing && uninteresting_const(typ, iscallee)
+    suppressed && (typ = nothing)
     nodeid = get(callsite_map, (fb, lb), 0)
     runtime = try is_runtime(node) catch; false end
 
@@ -364,7 +395,9 @@ function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
         # name in `checksquare(A0)`) is part of the surrounding expression, so
         # reporting that expression's type for it is accurate, not a guess.
         # Barriering leaves too would silence the most natural hover target.
-        is_leaf(node) && return false
+        # A dotted callee (`LAPACK.gesdd!`) is composite but not untyped -- see
+        # `suppressed` above -- so it falls through here as well.
+        (is_leaf(node) || suppressed) && return false
         print(io, "<span class=\"s-opaque\">")
         return true
     end

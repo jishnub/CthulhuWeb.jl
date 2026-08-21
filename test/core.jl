@@ -7,7 +7,7 @@ using CthulhuWeb
 # internals under test
 using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
-                  source_html, static_params, token_classmap
+                  is_name_resolution, source_html, static_params, token_classmap
 
 f() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
 rec(n) = n <= 1 ? 1 : n * rec(n - 1)
@@ -52,6 +52,10 @@ function syndemo(x)
     s = "value=$y"
     return sin(y) + length(s)
 end
+
+# `Mod.f(x)` lowers to `getproperty(Mod, :f)` and then the call. The getproperty
+# callsite's source range is the callee *name*, so it used to swallow the click.
+qualified(x) = Base.Math.sin(x)
 
 function srcdemo(x)
     T = x > 0 ? Int64 : Float64
@@ -463,6 +467,37 @@ end
 
     # and it really is the callee, reachable from the tree
     @test linked[kw].descendable
+end
+
+@testset "qualified calls descend into the call, not the name lookup" begin
+    # Clicking `LAPACK.gesdd!` in `LAPACK.gesdd!(x)` landed in
+    # `getproperty(x::Module, f::Symbol)`, because the getproperty callsite's
+    # source range is exactly the callee name and so nests inside the call span.
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    qmi = find_method_instance(provider, qualified, Tuple{Float64})
+    s = Session(provider, qmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+
+    kids = expand!(s, ROOT_ID; optimize=false)
+    # the plumbing really is there in the tree -- it is only the click map we filter
+    @test any(k -> is_name_resolution(s.nodes[k]), kids)
+
+    ids = [parse(Int, m.captures[1]) for m in eachmatch(r"data-node-id=\"(\d+)\"", html)]
+    linked = [s.nodes[i] for i in ids]
+    @test !isempty(linked)
+    @test !any(is_name_resolution, linked)
+    @test any(n -> n.label.name == "sin", linked)
+
+    # the whole `Base.Math.sin(x)` is one click target, so clicking the name
+    # descends into `sin` rather than into name resolution
+    sinid = ids[findfirst(n -> n.label.name == "sin", linked)]
+    inner = span_content(html, sinid)
+    @test startswith(replace(inner, r"<[^>]*>" => ""), "Base.Math.sin(")
+    # ...and the qualifier is not walled off by a barrier, which would kill hover
+    callee = first(split(inner, "("))
+    @test !occursin("s-opaque", callee)
+    @test !occursin("Core.Const", callee)     # `::Core.Const(Base.Math)` is noise
 end
 
 @testset "no type is reported where none is known" begin
