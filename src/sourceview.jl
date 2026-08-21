@@ -559,7 +559,7 @@ function, and one unmapped callsite for that node. `_modify2x2!` under
 the pairing has to be forced by the data, not picked.
 """
 function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, src,
-                          sparams::Dict{String,Any})
+                          sparams::Dict{String,Any}, unowned::Set{Tuple{Int,Int}})
     isempty(unplaced) && return unplaced
     nodes = Any[]
     unmapped(nd) = !haskey(callsite_map, (first_byte(nd), last_byte(nd)))
@@ -570,16 +570,15 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
             v === nothing || push!(nodes, (v, nd))
         end
         # Assignment is a call too, and one the source never names: `B[j,i] = v`
-        # is `setindex!`, `x.f = v` is `setproperty!`. Offer the target -- the
-        # `B[j,i]` -- rather than the whole statement, so the span does not
-        # swallow the right-hand side, which has calls of its own.
+        # is `setindex!(B, v, j, i)`, `x.f = v` is `setproperty!`. The whole
+        # statement is the call -- its arguments are the target, the indices and
+        # the right-hand side -- so the span covers it all, exactly as `f(x)`
+        # covers its arguments.
         kids = children(nd)
-        if k === K"=" && kids !== nothing && length(kids) == 2
-            lhs = kids[1]
-            fn = kind(lhs) === K"ref" ? setindex! :
-                 kind(lhs) === K"."   ? setproperty! : nothing
-            fn === nothing || unmapped(lhs) || (fn = nothing)
-            fn === nothing || push!(nodes, (fn, lhs))
+        if k === K"=" && kids !== nothing && length(kids) == 2 && unmapped(nd)
+            lk = kind(kids[1])
+            fn = lk === K"ref" ? setindex! : lk === K"." ? setproperty! : nothing
+            fn === nothing || push!(nodes, (fn, nd))
         end
         kids === nothing || foreach(scan, kids)
     end
@@ -598,6 +597,9 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
         claimants == 1 || (push!(left, k); continue)
         rng = (first_byte(target), last_byte(target))
         haskey(callsite_map, rng) && (push!(left, k); continue)
+        # `a[i] = v` evaluates to `v`, not to what `setindex!` returns, so the
+        # statement gets the click but not the annotation.
+        kind(target) === K"=" && push!(unowned, rng)
         l = n.label
         callsite_map[rng] = (id = k, rt = l.rt,
                              unstable = l.unstable, union = l.expected_union)
@@ -770,7 +772,7 @@ struct RenderCtx
     callsites::Dict{Tuple{Int,Int},NamedTuple}
     dead::Set{Tuple{Int,Int}}
     unverified::Set{Tuple{Int,Int}}
-    protocol::Set{Tuple{Int,Int}}
+    unowned::Set{Tuple{Int,Int}}
     sparams::Dict{String,Any}
     classmap::Vector{UInt8}
     offset::Int
@@ -894,9 +896,10 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     # Body only: the method's own signature is a `call` node whose callee is the
     # method itself, and it would tie with a recursive call in the body.
+    unowned = Set{Tuple{Int,Int}}()
     unplaced = try
         body === nothing ? unplaced :
-            place_by_callee!(callsite_map, s, unplaced, body, tsn.source, sparams)
+            place_by_callee!(callsite_map, s, unplaced, body, tsn.source, sparams, unowned)
     catch
         unplaced
     end
@@ -913,7 +916,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     startb = first_byte(tsn)
     ctx = RenderCtx(src, callsite_map, deadspans,
                     collect_unverified!(Set{Tuple{Int,Int}}(), tsn, callsite_map, false),
-                    collect_protocol!(Set{Tuple{Int,Int}}(), tsn),
+                    collect_unowned!(unowned, tsn),
                     sparams, token_classmap(src, startb, idxend), startb, idxend)
     io = IOBuffer()
     walk_source(io, tsn, startb, ctx)
@@ -981,8 +984,7 @@ function walk_source(io::IO, node, pos::Int, ctx::RenderCtx, iscallee::Bool = fa
 end
 
 """
-Is this node's inferred type the lowering's, rather than that of anything written
-in it?
+Spans whose type is not their own.
 
 A `for` header is: its type is `iterate`'s return,
 `Union{Nothing, Tuple{Int64, Int64}}`, which is the type of neither the loop
@@ -991,16 +993,19 @@ variable nor the iterable nor the header as an expression. In
 rendered amber -- reading as if the loop variable were type-unstable. The outer
 `j` happened to be typed, so the same two loops disagreed.
 
-The span stays (it is the `iterate` callsite, worth descending into); only the
-annotation goes.
+An assignment placed as a `setindex!`/`setproperty!` call joins them: `a[i] = v`
+evaluates to `v`, not to what `setindex!` returns.
+
+The span stays in both cases -- `iterate` and `setindex!` are worth descending
+into; only the annotation goes.
 """
-function collect_protocol!(d::Set{Tuple{Int,Int}}, node)
+function collect_unowned!(d::Set{Tuple{Int,Int}}, node)
     # The `=` / `in` child spans the same bytes as the header it sits in and gets
     # the same callsite, so record the range rather than testing the kind.
     kind(node) === K"iteration" && push!(d, (first_byte(node), last_byte(node)))
     kids = children(node)
     kids === nothing || for c in kids
-        collect_protocol!(d, c)
+        collect_unowned!(d, c)
     end
     return d
 end
@@ -1079,7 +1084,7 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
 
     classes = ["s"]
     issparam && push!(classes, "s-sparam")
-    if (fb, lb) in ctx.protocol
+    if (fb, lb) in ctx.unowned
         # Keep the span (it is a callsite, and `iterate` is worth descending
         # into) but report no type, so nothing inherits one that is not its own.
         typ = nothing

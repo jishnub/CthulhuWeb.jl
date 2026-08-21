@@ -767,10 +767,23 @@ end
         t === nothing || @test !startswith(t.captures[1], "Union{Nothing,")
     end
 
-    # `B[j,i] = A[i,j]` is a setindex!: no call node in the source, no name in
-    # the text, but the assignment target is unambiguously where it goes
+    # `B[j, i] = A[i, j]` is a setindex!: no call node in the source, no name in
+    # the text, but the assignment is unambiguously where it goes
     @test "setindex!" in linked
     @test !occursin("note unlocated", html)
+
+    # the span covers the whole statement, as `f(x)` covers its arguments --
+    # `setindex!(B, A[i,j], j, i)` takes the right-hand side as an argument
+    sid = only(unique(m.captures[1] for m in eachmatch(r"data-node-id=\"(\d+)\"", code)
+                      if s.nodes[parse(Int, m.captures[1])].label.name == "setindex!"))
+    @test strip(replace(span_content(code, parse(Int, sid)), r"<[^>]*>" => "")) ==
+          "B[j, i] = A[i, j]"
+    # ...but carries no type: the statement evaluates to the right-hand side,
+    # not to what `setindex!` returns
+    opener = first(eachmatch(Regex("<span[^>]*data-node-id=\"$(sid)\"[^>]*>"), code))
+    @test !occursin("data-type", opener.match)
+    # the right-hand side keeps its own click target inside
+    @test "getindex" in linked
 end
 
 @testset "unlocated callsites are placed by callee, then named" begin
