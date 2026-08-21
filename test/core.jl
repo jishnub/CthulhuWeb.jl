@@ -4,7 +4,7 @@ using Cthulhu
 using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
                 find_method_instance
 using CthulhuWeb
-using JuliaSyntax: @K_str
+using JuliaSyntax: @K_str, first_byte, last_byte
 # internals under test
 using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
@@ -53,6 +53,16 @@ function syndemo(x)
     y = rand(T) + 2.5
     s = "value=$y"
     return sin(y) + length(s)
+end
+
+# A method whose callee is spelled by interpolation, as LinearAlgebra's
+# `($func)(A::AbstractTriangular; kwargs...) = ($func)(...; kwargs...)` is.
+# Splatted keywords lower to `isempty(kws) ? f(args...) : kwcall(kws, f, args...)`
+# and the `isempty` test is attributed to the whole call, so two callsites share
+# one range -- with no name in the source to tell them apart.
+kwtarget(v::Vector{Float64}; scale=1.0) = sum(v) * scale
+for fn in (:kwtarget,)
+    @eval kwforward(v::Vector{Float64}; kwargs...) = ($fn)(copy(v); kwargs...)
 end
 
 # `x^n` with a literal exponent lowers to `literal_pow(^, x, Val(n))`. The
@@ -509,6 +519,44 @@ end
     callee = first(split(inner, "("))
     @test !occursin("s-opaque", callee)
     @test !occursin("Core.Const", callee)     # `::Core.Const(Base.Math)` is noise
+end
+
+@testset "an interpolated callee descends into the call, not the kwargs test" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    fmi = find_method_instance(provider, kwforward, Tuple{Vector{Float64}})
+    s = Session(provider, fmi; config=cfg)
+    # the outer shim forwards; the body method is where the interpolation lives
+    kids = expand!(s, ROOT_ID; optimize=false)
+    bid = findfirst(k -> occursin("kwforward#", s.nodes[k].label.name), kids)
+    @test bid !== nothing
+    body = s.nodes[kids[bid]]
+
+    html = source_html(s, body, cfg)
+    @test html !== nothing
+    linked = [s.nodes[parse(Int, m.captures[1])].label.name
+              for m in eachmatch(r"data-node-id=\"(\d+)\"", html)]
+    @test "kwtarget" in linked
+    @test !("isempty" in linked)
+
+    # both callsites really do share the range: this is a tie the name heuristic
+    # cannot break, because `($fn)` has no name in it
+    result = lookup_cached!(s, body, false)
+    tsn = first(Cthulhu.get_typed_sourcetext(body.mi, result.src, result.rt))
+    bkids = expand!(s, kids[bid]; optimize=false)
+    cs, sn = Cthulhu.find_callsites(provider, result, body.ci, true)
+    ranges = Dict{Tuple{Int,Int},Vector{String}}()
+    for (i, x) in enumerate(sn)
+        x isa Cthulhu.Callsite && continue
+        push!(get!(ranges, (first_byte(x), last_byte(x)), String[]),
+              s.nodes[bkids[i]].label.name)
+    end
+    shared = [v for v in values(ranges) if length(v) > 1]
+    @test any(v -> "isempty" in v && "kwtarget" in v, shared)
+
+    # the tiebreak is the inferred type of the span, which only `kwtarget` has
+    tys = CthulhuWeb.span_types!(Dict{Tuple{Int,Int},String}(), tsn)
+    rng = first(k for (k, v) in ranges if "isempty" in v && "kwtarget" in v)
+    @test get(tys, rng, nothing) == "Float64"
 end
 
 @testset "lowering-invented constructors are not click targets" begin

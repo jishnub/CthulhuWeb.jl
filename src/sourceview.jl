@@ -189,11 +189,25 @@ as the call. Taking the first in SSA order landed the user in `boot.jl` at
 clicked. Prefer, in order: a callee whose name matches what is written in the
 source, then `Core.kwcall` (the real dispatch for a keyword call), then anything
 that is not an obvious NamedTuple constructor.
+
+Ties are broken on the inferred type. A span's type *is* the type of the
+expression it denotes, so the candidate whose return type matches is the one
+that produced the value; the others are lowering that happens to sit at the same
+place. This is what separates the two callsites of
+`(\$func)(copyto!(similar(parent(A)), A); kwargs...)`: splatted keywords lower to
+`isempty(kws) ? f(args...) : kwcall(kws, f, args...)`, and the `isempty` test is
+attributed to the whole call. Its `Bool` does not match the span's `SVD{...}`,
+and the name heuristic cannot help because `(\$func)` has no name to match.
 """
-function pick_callsite(s::Session, cands::Vector{Int}, spantext::AbstractString)
+function pick_callsite(s::Session, cands::Vector{Int}, spantext::AbstractString,
+                       spantype::Union{Nothing,String})
     length(cands) == 1 && return only(cands)
     lead = match(r"^\s*([A-Za-z_][A-Za-z0-9_!]*)", spantext)
     leadname = lead === nothing ? nothing : String(lead.captures[1])
+    # Lexicographic: the name/kind judgement first, the type match only as a
+    # tiebreak, so a candidate named in the source is never overruled by one that
+    # merely shares its return type.
+    rtmatch(k) = spantype !== nothing && s.nodes[k].label.rt == spantype
     function score(k)
         n = s.nodes[k]
         ctor = constructed_type(n)
@@ -211,7 +225,22 @@ function pick_callsite(s::Session, cands::Vector{Int}, spantext::AbstractString)
         ctor === nothing || return 0
         return 1
     end
-    return cands[argmax(map(score, cands))]
+    return cands[argmax([(score(k), rtmatch(k)) for k in cands])]
+end
+
+"""
+Byte range -> inferred type, for every annotated node in the tree. Built in one
+pass so `pick_callsite` can compare a candidate's return type against the type of
+the expression its span denotes.
+"""
+function span_types!(d::Dict{Tuple{Int,Int},String}, node)
+    typ = node.typ
+    typ === nothing || (d[(first_byte(node), last_byte(node))] = string(typ))
+    kids = children(node)
+    kids === nothing || for c in kids
+        span_types!(d, c)
+    end
+    return d
 end
 
 """
@@ -311,8 +340,10 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
                 is_synthetic_construct(kn, kind(sn)) && continue
                 push!(get!(cands, (first_byte(sn), last_byte(sn)), Int[]), kids[i])
             end
+            spantypes = span_types!(Dict{Tuple{Int,Int},String}(), tsn)
             for (key, ks) in cands
-                callsite_map[key] = pick_callsite(s, ks, String(tsn.source[key[1]:key[2]]))
+                callsite_map[key] = pick_callsite(s, ks, String(tsn.source[key[1]:key[2]]),
+                                                  get(spantypes, key, nothing))
             end
         end
     catch
