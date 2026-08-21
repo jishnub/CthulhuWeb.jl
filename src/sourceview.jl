@@ -538,6 +538,59 @@ function pick_callsite(s::Session, cands::Vector{Int}, sn, src,
 end
 
 """
+Place callsites Cthulhu did not, where the source says unambiguously where.
+
+`f!(dest, parent(src))` in `copyto_unaliased!` gets no source node, so the call
+was neither clickable nor listed -- the list keys on the callee's name and the
+source says `f!`. But inference typed that callee `Core.Const(adjoint!)` and the
+callsite dispatches on `typeof(adjoint!)`, which is the same identity match
+`pick_callsite` already uses to choose between callsites sharing a range.
+
+Searched in the body only -- a method's own signature is a `call` node whose
+callee is the method itself, and would tie with any recursive call.
+
+Required unique in both directions: one unmapped call node whose callee is this
+function, and one unmapped callsite for that node. `_modify2x2!` under
+`@stable_muladdmul` has two callsites for its one node, so it stays unplaced --
+the pairing has to be forced by the data, not picked.
+"""
+function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, src,
+                          sparams::Dict{String,Any})
+    isempty(unplaced) && return unplaced
+    nodes = Any[]
+    function scan(nd)
+        k = kind(nd)
+        if (k === K"call" || k === K"dotcall") &&
+           !haskey(callsite_map, (first_byte(nd), last_byte(nd)))
+            v = callee_value(nd, src, sparams)
+            v === nothing || push!(nodes, (v, nd))
+        end
+        kids = children(nd)
+        kids === nothing || foreach(scan, kids)
+    end
+    scan(tsn)
+    isempty(nodes) && return unplaced
+
+    left = Int[]
+    for k in unplaced
+        n = s.nodes[k]
+        hits = [nd for (v, nd) in nodes if callee_matches(n, v)]
+        length(hits) == 1 || (push!(left, k); continue)
+        target = hits[1]
+        claimants = count(unplaced) do j
+            any(((v, nd),) -> nd === target && callee_matches(s.nodes[j], v), nodes)
+        end
+        claimants == 1 || (push!(left, k); continue)
+        rng = (first_byte(target), last_byte(target))
+        haskey(callsite_map, rng) && (push!(left, k); continue)
+        l = n.label
+        callsite_map[rng] = (id = k, rt = l.rt,
+                             unstable = l.unstable, union = l.expected_union)
+    end
+    return left
+end
+
+"""
 Does the source text name this callee anywhere?
 
 The test for whether an unlocated callsite is worth reporting. Cthulhu maps most
@@ -821,6 +874,15 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
             idxend = last_byte(sig)
             truncated = true
         end
+    end
+
+    # Body only: the method's own signature is a `call` node whose callee is the
+    # method itself, and it would tie with a recursive call in the body.
+    unplaced = try
+        body === nothing ? unplaced :
+            place_by_callee!(callsite_map, s, unplaced, body, tsn.source, sparams)
+    catch
+        unplaced
     end
 
     # Dead-code marking applies to the body only. A signature default like

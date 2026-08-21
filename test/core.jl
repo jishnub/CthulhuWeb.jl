@@ -60,6 +60,13 @@ function syndemo(x)
     return sin(y) + length(s)
 end
 
+# A callee held in a variable: the source never spells `sum`, so a name-based
+# test cannot find it -- but inference typed `g` as `Core.Const(sum)`.
+function viavariable(v::Vector{Float64})
+    g = sum
+    g(v)
+end
+
 # Cthulhu locates most callsites in the source, but not all: here it places
 # `min` and not `unlocatable_helper`, which is written just as plainly.
 unlocatable_helper(a::Int, b::Int) = a * b
@@ -722,37 +729,54 @@ end
     @test occursin(r"data-type=\"::[^\"]*\" data-node-id=", mhtml)
 end
 
-@testset "callsites Cthulhu could not locate are named, not dropped" begin
+@testset "unlocated callsites are placed by callee, then named" begin
     cfg = headless_config(CONFIG; view=:source, iswarn=true)
 
-    # a call in statement position whose result goes unused: Cthulhu returns no
-    # source node for it, so the pane has no span to hang a click on
+    # A call in statement position whose result goes unused gets no source node
+    # from Cthulhu -- but inference typed its callee, and exactly one call node in
+    # the body has that callee, so the pairing is forced. It becomes clickable.
     umi = find_method_instance(provider, unlocatable, Tuple{Vector{Float64}})
     s = Session(provider, umi; config=cfg)
     html = source_html(s, s.nodes[ROOT_ID], cfg)
     @test html !== nothing
-    note = match(r"<p class=\"note unlocated\">.*?</ul>"s, html)
-    @test note !== nothing
-    @test occursin("unlocatable_helper", note.match)
-    # the same MethodInstance reached from several folded callsites is listed
-    # once: `_mul!` tests two chars against six literals, all `==(::Char, ::Char)`
-    mmi = find_method_instance(provider, LinearAlgebra._mul!,
-              Tuple{Matrix{Float64}, Matrix{Float64}, Matrix{Float64}, Bool, Bool})
+    code = replace(html, r"^.*?<pre class=\"code src\">"s => "", r"</pre></div>.*$"s => "")
+    placed = [s.nodes[parse(Int, m.captures[1])].label.name
+              for m in eachmatch(r"data-node-id=\"(\d+)\"", code)]
+    @test "unlocatable_helper" in placed
+    @test !occursin("note unlocated", html)     # nothing left to list
+
+    # ...and a call through a variable is placed the same way, since the match is
+    # on the callee's identity rather than on how it is spelled
+    cmi = find_method_instance(provider, viavariable, Tuple{Vector{Float64}})
+    c = Session(provider, cmi; config=cfg)
+    chtml = source_html(c, c.nodes[ROOT_ID], cfg)
+    ccode = replace(chtml, r"^.*?<pre class=\"code src\">"s => "", r"</pre></div>.*$"s => "")
+    @test "sum" in [c.nodes[parse(Int, m.captures[1])].label.name
+                    for m in eachmatch(r"data-node-id=\"(\d+)\"", ccode)]
+
+    # Where the pairing is NOT forced it stays a list: `@stable_muladdmul`
+    # duplicates its argument, so one `_modify2x2!(...)` node has two callsites.
+    mmi = find_method_instance(provider, LinearAlgebra.matmul2x2or3x3_nonzeroalpha!,
+              Tuple{Matrix{Float64}, Char, Char, Matrix{Float64}, Matrix{Float64},
+                    Bool, Bool})
     ms = Session(provider, mmi; config=cfg)
-    mnote = match(r"<p class=\"note unlocated\">.*?</ul>"s,
-                  something(source_html(ms, ms.nodes[ROOT_ID], cfg), ""))
-    if mnote !== nothing
-        listed = [m.captures[1] for m in eachmatch(r"<button[^>]*>([^<]*)</button>", mnote.match)]
-        @test length(listed) == length(unique(listed))
-    end
-    # ...and the helper it goes through keys on the MethodInstance
-    dupes = [k for k in expand!(ms, ROOT_ID; optimize=false)
-             if ms.nodes[k].mi !== nothing]
-    @test length(unique_callsites(ms, dupes)) ==
-          length(unique(ms.nodes[k].mi for k in dupes))
+    mhtml = source_html(ms, ms.nodes[ROOT_ID], cfg)
+    note = match(r"<p class=\"note unlocated\">.*?</ul>"s, mhtml)
+    @test note !== nothing
+    @test occursin("_modify2x2!", note.match)
+    # named with working links, not merely mentioned
+    ids = [parse(Int, m.captures[1]) for m in eachmatch(r"data-node-id=\"(\d+)\"", note.match)]
+    @test !isempty(ids)
+    @test all(i -> ms.nodes[i].descendable, ids)
+    # one <li> per call, so several never run together into one wrapped blob
+    @test occursin("<ul class=\"unlocated-list\">", note.match)
+    @test length(collect(eachmatch(r"<li>", note.match))) == length(ids)
+    # ...and the note sits after the source, not before it
+    @test something(findfirst("note unlocated", mhtml)).start >
+          something(findfirst("<pre class=\"code src\">", mhtml)).start
 
     # entries are one clean line each: no leading indent, no internal breaks
-    for m in eachmatch(r"<button[^>]*>([^<]*)</button>", html)
+    for m in eachmatch(r"<button[^>]*>([^<]*)</button>", note.match)
         @test m.captures[1] == strip(m.captures[1])
         @test !occursin(r"\s\s|\n", m.captures[1])
     end
@@ -760,24 +784,17 @@ end
     css2 = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "style.css"), String)
     @test occursin(r"\.unlocated-list \.bodylink \{[^}]*padding-left: 0", css2)
 
-    # one <li> per call, so several never run together into one wrapped blob
-    @test occursin("<ul class=\"unlocated-list\">", note.match)
-    @test length(collect(eachmatch(r"<li>", note.match))) ==
-          length(collect(eachmatch(r"data-node-id=", note.match)))
-    # it is named with a working link, not merely mentioned
-    id = match(r"data-node-id=\"(\d+)\"", note.match)
-    @test id !== nothing
-    @test s.nodes[parse(Int, id.captures[1])].label.name == "unlocatable_helper"
-    @test s.nodes[parse(Int, id.captures[1])].descendable
-    # ...and the note sits after the source, not before it
-    @test something(findfirst("note unlocated", html)).start >
-          something(findfirst("<pre class=\"code src\">", html)).start
+    # the same MethodInstance reached from several callsites is listed once
+    @test length(unique(ids)) == length(ids)
+    dupes = [k for k in expand!(ms, ROOT_ID; optimize=false) if ms.nodes[k].mi !== nothing]
+    @test length(unique_callsites(ms, dupes)) ==
+          length(unique(ms.nodes[k].mi for k in dupes))
 
     # `pw`'s `Base.literal_pow` and `idx`'s `lastindex` are unlocated too, but
     # they are lowering nobody wrote -- their names are not in the source.
     for (g, tt) in ((powbody, Tuple{Float64}), (deadbranch, Tuple{Tuple{Int,Int}}))
-        s = Session(provider, find_method_instance(provider, g, tt); config=cfg)
-        @test !occursin("note unlocated", source_html(s, s.nodes[ROOT_ID], cfg))
+        t = Session(provider, find_method_instance(provider, g, tt); config=cfg)
+        @test !occursin("note unlocated", source_html(t, t.nodes[ROOT_ID], cfg))
     end
 
     # the membership test is on tokens, so `parent` must not match inside
@@ -796,11 +813,10 @@ end
     @test "γ" in mt
     @test "+" in mt
 
-    mmi = find_method_instance(provider, multibyte, Tuple{Float64,Float64})
-    ms = Session(provider, mmi; config=cfg)
-    @test source_html(ms, ms.nodes[ROOT_ID], cfg) !== nothing
+    mmi2 = find_method_instance(provider, multibyte, Tuple{Float64,Float64})
+    ms2 = Session(provider, mmi2; config=cfg)
+    @test source_html(ms2, ms2.nodes[ROOT_ID], cfg) !== nothing
 end
-
 @testset "code compiled out is greyed, not silently normal" begin
     cfg = headless_config(CONFIG; view=:source, iswarn=true)
     dmi = find_method_instance(provider, deadbranch, Tuple{Tuple{Int,Int}})
