@@ -105,6 +105,8 @@ body.hide-stable .node:not(.unstable):not(.is-recursive) > .row { opacity: .45; 
 #code { padding: 10px 12px 40px; }
 pre.code { margin: 0; white-space: pre; overflow-x: auto; tab-size: 4; }
 .note { color: var(--muted); }
+/* sits BELOW the source, unlike the other notes, so it needs its own separation */
+.note.unlocated { margin-top: .75rem; }
 .err  { color: var(--red); white-space: pre-wrap; }
 
 /* ANSI SGR classes emitted by ansi_to_html */

@@ -29,7 +29,7 @@ using Cthulhu: AbstractProvider, CONFIG, Callsite, CthulhuConfig, CthulhuState,
 using JuliaSyntax: JuliaSyntax, @K_str, children, first_byte, is_infix_op_call,
                    is_keyword, is_leaf, is_operator, is_postfix_op_call, kind,
                    last_byte, source_line,
-                   tokenize
+                   tokenize, untokenize
 using TypedSyntax: TypedSyntax, is_runtime
 using CodeTracking: CodeTracking
 using InteractiveUtils: InteractiveUtils, is_expected_union

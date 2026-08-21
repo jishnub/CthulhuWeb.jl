@@ -420,6 +420,69 @@ function pick_callsite(s::Session, cands::Vector{Int}, sn, src,
 end
 
 """
+Does the source text name this callee anywhere?
+
+The test for whether an unlocated callsite is worth reporting. Cthulhu maps most
+callsites to a source range, but not all: in
+`generic_matmatmul_wrapper!` it locates `matmul2x2or3x3_nonzeroalpha!` and not
+`matmul_size_check`, both of which are written plainly in the body. Those are
+worth reporting; `literal_pow`, `setproperty!`, `convert`, `lastindex`, `pairs`
+and the rest of the unlocated set are lowering the user never wrote, and their
+names do not appear.
+
+Membership in the token stream, not a substring search: `parent` must not match
+inside `parentmodule`, a `-` inside `->` is not a call to `-`, and nothing in a
+comment or a string literal counts at all.
+"""
+function names_in_source(n::Node, tokens::Set{String})
+    ctor = constructed_type(n)
+    cands = ctor === nothing ? [n.label.name] : ctor_names(ctor)
+    return any(nm -> replace(nm, r"^.*\." => "") in tokens, cands)
+end
+
+"""
+Identifier and operator tokens of a source fragment -- the names it actually
+calls things by.
+
+Text comes from `untokenize` rather than slicing on `t.range`: that range is in
+BYTES, and `String` slicing rejects an index inside a multi-byte character, so
+`α::Number` in `generic_matmatmul_wrapper!` throws two tokens in and takes the
+whole set down with it. Letting JuliaSyntax cut its own token leaves no index
+arithmetic to get wrong.
+"""
+function source_tokens(text::AbstractString)
+    out = Set{String}()
+    try
+        for t in tokenize(text)
+            k = kind(t)
+            (is_operator(k) || k === K"Identifier") || continue
+            push!(out, untokenize(t, text))
+        end
+    catch
+        # unlexable fragment: report nothing rather than guess
+    end
+    return out
+end
+
+"""
+Callsites Cthulhu could not place in the source, listed rather than dropped.
+
+The source pane is a view of the call tree, and silently omitting a call the
+tree does hold makes it look like the call is not there. Naming them -- without
+guessing at a span, which would be inventing information Cthulhu did not give
+us -- keeps the pane honest and still reachable.
+"""
+function unlocated_note(s::Session, ids::Vector{Int})
+    isempty(ids) && return ""
+    links = join(map(ids) do k
+        "<button class=\"s-call bodylink\" data-node-id=\"$(k)\">" *
+        html_escape(body_label(s.nodes[k])) * "</button>"
+    end, " ")
+    return "<p class=\"note unlocated\">Also called here, but Cthulhu could not " *
+           "locate it in the source: " * links * "</p>"
+end
+
+"""
 Is `child` the body method of `parent`? Julia lowers `f(x, n=1)` to a shim `f(x)`
 calling `f(x, 1)`, and `f(x; kw=1)` to a shim calling a gensym `#f#NN`. Other
 children of a shim are default-value computations (`eltype(A0)` in
@@ -505,6 +568,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     sparams = Dict{String,Any}(static_params(node.mi))
 
     callsite_map = Dict{Tuple{Int,Int},Int}()
+    unplaced = Int[]
     try
         callsites, sourcenodes = find_callsites(s.provider, result, node.ci, true)
         if length(kids) == length(callsites) == length(sourcenodes)
@@ -514,7 +578,10 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
             cands = Dict{Tuple{Int,Int},Vector{Int}}()
             spannode = Dict{Tuple{Int,Int},Any}()
             for (i, sn) in enumerate(sourcenodes)
-                isa(sn, Callsite) && continue      # no source node for this callsite
+                if isa(sn, Callsite)               # no source node for this callsite
+                    push!(unplaced, kids[i])
+                    continue
+                end
                 kn = s.nodes[kids[i]]
                 is_name_resolution(kn) && continue
                 is_synthetic_construct(kn, kind(sn)) && continue
@@ -577,6 +644,15 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
         "<div class=\"srcfile\">" * html_escape(node.label.file) * "</div>"
     note = truncated ? truncated_note(s, node, kids) : ""
 
+    # A truncated shim already links its body method, and every other callsite it
+    # has is lowering; listing them there would only repeat and clutter.
+    shown = truncated ? Set{String}() :
+        source_tokens(String(src[startb:min(idxend, lastindex(src))]))
+    unlocated = [k for k in unplaced
+                 if (s.nodes[k].descendable || s.nodes[k].expandable) &&
+                    names_in_source(s.nodes[k], shown)]
+    tail = unlocated_note(s, unlocated)
+
     sp = isempty(sparams) ? "" :
         "<div class=\"sparams\">where " *
         join(["<b>" * html_escape(k) * "</b> = " * html_escape(string(v))
@@ -584,7 +660,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     return file * sp * note *
         "<div class=\"srcwrap\"><pre class=\"gutter\">" * gutter * "</pre>" *
-        "<pre class=\"code src\">" * code * "</pre></div>"
+        "<pre class=\"code src\">" * code * "</pre></div>" * tail
 end
 
 "Recursively emit `node`'s byte range, wrapping typed sub-expressions in spans.

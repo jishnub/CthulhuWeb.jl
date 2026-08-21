@@ -10,6 +10,7 @@ using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ans
                   headless_config, lookup_cached!, node_record, render_body,
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
+                  names_in_source, source_tokens,
                   source_html, static_params, token_classmap
 
 f() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
@@ -54,6 +55,22 @@ function syndemo(x)
     y = rand(T) + 2.5
     s = "value=$y"
     return sin(y) + length(s)
+end
+
+# Cthulhu locates most callsites in the source, but not all: here it places
+# `min` and not `unlocatable_helper`, which is written just as plainly.
+unlocatable_helper(a::Int, b::Int) = a * b
+function unlocatable(v::Vector{Float64})
+    n = length(v)
+    unlocatable_helper(n, 2)
+    return min(n, 3)
+end
+
+# multi-byte identifiers in a signature: `t.range` is a BYTE range, so lexing
+# this used to die partway through and report no tokens at all
+function multibyte(α::Float64, β::Float64)
+    γ = α + β
+    return sqrt(γ)
 end
 
 # A branch that folds away: for an `NTuple` argument the first test is const
@@ -537,6 +554,55 @@ end
     callee = first(split(inner, "("))
     @test !occursin("s-opaque", callee)
     @test !occursin("Core.Const", callee)     # `::Core.Const(Base.Math)` is noise
+end
+
+@testset "callsites Cthulhu could not locate are named, not dropped" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+
+    # a call in statement position whose result goes unused: Cthulhu returns no
+    # source node for it, so the pane has no span to hang a click on
+    umi = find_method_instance(provider, unlocatable, Tuple{Vector{Float64}})
+    s = Session(provider, umi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+    note = match(r"<p class=\"note unlocated\">.*?</p>"s, html)
+    @test note !== nothing
+    @test occursin("unlocatable_helper", note.match)
+    # it is named with a working link, not merely mentioned
+    id = match(r"data-node-id=\"(\d+)\"", note.match)
+    @test id !== nothing
+    @test s.nodes[parse(Int, id.captures[1])].label.name == "unlocatable_helper"
+    @test s.nodes[parse(Int, id.captures[1])].descendable
+    # ...and the note sits after the source, not before it
+    @test something(findfirst("note unlocated", html)).start >
+          something(findfirst("<pre class=\"code src\">", html)).start
+
+    # `pw`'s `Base.literal_pow` and `idx`'s `lastindex` are unlocated too, but
+    # they are lowering nobody wrote -- their names are not in the source.
+    for (g, tt) in ((powbody, Tuple{Float64}), (deadbranch, Tuple{Tuple{Int,Int}}))
+        s = Session(provider, find_method_instance(provider, g, tt); config=cfg)
+        @test !occursin("note unlocated", source_html(s, s.nodes[ROOT_ID], cfg))
+    end
+
+    # the membership test is on tokens, so `parent` must not match inside
+    # `parentmodule`, and `-` inside `->` is not a call to `-`
+    toks = source_tokens("a -> parentmodule(x) # size")
+    @test "parentmodule" in toks
+    @test !("parent" in toks)
+    @test "->" in toks
+    @test !("-" in toks)
+    @test !("size" in toks)          # in a comment, not called
+
+    # multi-byte identifiers must not truncate the token scan
+    mt = source_tokens("function multibyte(α::Float64, β::Float64)\n    γ = α + β\nend")
+    @test "multibyte" in mt
+    @test "α" in mt
+    @test "γ" in mt
+    @test "+" in mt
+
+    mmi = find_method_instance(provider, multibyte, Tuple{Float64,Float64})
+    ms = Session(provider, mmi; config=cfg)
+    @test source_html(ms, ms.nodes[ROOT_ID], cfg) !== nothing
 end
 
 @testset "code compiled out is greyed, not silently normal" begin
