@@ -684,6 +684,44 @@ end
     @test nothing_mapped(nothing)
 end
 
+@testset "a call span reports the callsite's return type" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    # The syntax node's own type comes from mapping IR statements onto source
+    # ranges; where the span IS a callsite, Cthulhu's `rt` is what the tree shows
+    # and what the tooltip must agree with.
+    dmi = find_method_instance(provider, srcdemo, Tuple{Float64})
+    s = Session(provider, dmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test html !== nothing
+    for m in eachmatch(r"data-type=\"::([^\"]*)\" data-node-id=\"(\d+)\"", html)
+        @test m.captures[1] == s.nodes[parse(Int, m.captures[2])].label.rt
+    end
+
+    # A macro can expand one range into several statements, so an unplaced call
+    # under one has no type we can vouch for -- better none than another
+    # statement's. `@stable_muladdmul` duplicates its argument into two branches,
+    # and the mapping handed the `_modify2x2!(...)` call the `MulAddMul{...}` the
+    # expansion constructs; the call itself returns `Any`.
+    mmi = find_method_instance(provider, LinearAlgebra.matmul2x2or3x3_nonzeroalpha!,
+              Tuple{Matrix{Float64}, Char, Char, Matrix{Float64}, Matrix{Float64},
+                    Bool, Bool})
+    @test mmi !== nothing
+    ms = Session(provider, mmi; config=cfg)
+    mhtml = source_html(ms, ms.nodes[ROOT_ID], cfg)
+    @test mhtml !== nothing
+    @test occursin("_modify2x2!", mhtml)
+    # the span opening at `_modify2x2!` carries no type at all...
+    at = something(findfirst("_modify2x2!", mhtml)).start
+    opener = match(r"<span[^>]*>$", mhtml[1:at-1])
+    @test opener !== nothing
+    @test !occursin("data-type", opener.match)
+    # ...rather than the constructed type it used to report
+    @test !occursin("data-type=\"::Core.Const(LinearAlgebra.MulAddMul", mhtml)
+
+    # calls Cthulhu DID place keep theirs, macro or not
+    @test occursin(r"data-type=\"::[^\"]*\" data-node-id=", mhtml)
+end
+
 @testset "callsites Cthulhu could not locate are named, not dropped" begin
     cfg = headless_config(CONFIG; view=:source, iswarn=true)
 

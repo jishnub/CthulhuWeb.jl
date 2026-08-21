@@ -686,6 +686,50 @@ function truncated_note(s::Session, node::Node, kids::Vector{Int})
 end
 
 """
+Everything `walk_source` needs that is fixed for one method render. A struct
+rather than a dozen positional arguments, which is what this had grown into --
+`cfg` was still being threaded through both functions without being read.
+"""
+struct RenderCtx
+    src::Any
+    callsites::Dict{Tuple{Int,Int},NamedTuple}
+    dead::Set{Tuple{Int,Int}}
+    unverified::Set{Tuple{Int,Int}}
+    sparams::Dict{String,Any}
+    classmap::Vector{UInt8}
+    offset::Int
+    idxend::Int
+end
+
+"""
+Call nodes under a macro that Cthulhu did not place.
+
+A macro can expand one source range into several IR statements -- under
+`@stable_muladdmul`, `_modify2x2!(...)` becomes a call in each of two branches --
+so whichever type the mapping picks for that range is arbitrary. It picked the
+`MulAddMul{...}` the expansion constructs, and hovering the call reported a type
+object where the call returns `Any`.
+
+Where a callsite IS placed we take Cthulhu's return type and the question does
+not arise; where none is and a macro could have multiplied the mapping, the
+honest answer is no type at all. Outside macros the mapping is one-to-one, so
+unplaced calls -- `sub_int`, `getfield`, the intrinsics, 1555 of them across the
+corpus against 81 here -- keep their annotations.
+"""
+function collect_unverified!(d::Set{Tuple{Int,Int}}, node, callsites, inmacro::Bool)
+    k = kind(node)
+    if inmacro && (k === K"call" || k === K"dotcall") && node.typ !== nothing &&
+       !haskey(callsites, (first_byte(node), last_byte(node)))
+        push!(d, (first_byte(node), last_byte(node)))
+    end
+    kids = children(node)
+    kids === nothing || for c in kids
+        collect_unverified!(d, c, callsites, inmacro || k === K"macrocall")
+    end
+    return d
+end
+
+"""
     source_html(session, node, cfg) -> String
 
 Render the node's source with nested `<span>`s carrying inferred types, and
@@ -712,7 +756,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     kids = expand!(s, node.id; optimize=false)
     sparams = Dict{String,Any}(static_params(node.mi))
 
-    callsite_map = Dict{Tuple{Int,Int},Int}()
+    callsite_map = Dict{Tuple{Int,Int},NamedTuple}()
     unplaced = Int[]
     try
         callsites, sourcenodes = find_callsites(s.provider, result, node.ci, true)
@@ -736,8 +780,14 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
             end
             spantypes = span_types!(Dict{Tuple{Int,Int},String}(), tsn)
             for (key, ks) in cands
-                callsite_map[key] = pick_callsite(s, ks, spannode[key], tsn.source,
-                                                  get(spantypes, key, nothing), sparams)
+                k = pick_callsite(s, ks, spannode[key], tsn.source,
+                                  get(spantypes, key, nothing), sparams)
+                l = s.nodes[k].label
+                # Carry Cthulhu's own return type for the callsite, not just the
+                # id. See `open_span`: for a call the two can disagree, and the
+                # syntax node is the one that is wrong.
+                callsite_map[key] = (id = k, rt = l.rt,
+                                     unstable = l.unstable, union = l.expected_union)
             end
         end
     catch
@@ -776,10 +826,11 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
 
     src = tsn.source
     startb = first_byte(tsn)
-    cm = token_classmap(src, startb, idxend)
+    ctx = RenderCtx(src, callsite_map, deadspans,
+                    collect_unverified!(Set{Tuple{Int,Int}}(), tsn, callsite_map, false),
+                    sparams, token_classmap(src, startb, idxend), startb, idxend)
     io = IOBuffer()
-    walk_source(io, tsn, startb, src, callsite_map, idxend, cfg, sparams, cm, startb,
-                deadspans)
+    walk_source(io, tsn, startb, ctx)
     code = String(take!(io))
 
     firstline = source_line(src, first_byte(tsn))
@@ -814,19 +865,16 @@ end
 "Recursively emit `node`'s byte range, wrapping typed sub-expressions in spans.
 Returns the next byte position to emit. Ranges from a syntax tree nest properly
 by construction, so the spans can never overlap-without-containment."
-function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
-                     cfg::CthulhuConfig, sparams::Dict{String,Any}, cm, offset::Int,
-                     deadspans::Set{Tuple{Int,Int}},
-                     iscallee::Bool = false)
+function walk_source(io::IO, node, pos::Int, ctx::RenderCtx, iscallee::Bool = false)
     fb, lb = first_byte(node), last_byte(node)
-    fb > idxend && return pos
-    lb = min(lb, idxend)
+    fb > ctx.idxend && return pos
+    lb = min(lb, ctx.idxend)
     lb < fb && return pos
 
     # text between the previous sibling and this node (whitespace, operators, ...)
-    pos < fb && emit_code(io, src, pos, fb - 1, cm, offset)
+    pos < fb && emit_code(io, ctx.src, pos, fb - 1, ctx.classmap, ctx.offset)
 
-    opened = open_span(io, node, fb, lb, src, callsite_map, cfg, sparams, deadspans, iscallee)
+    opened = open_span(io, node, fb, lb, ctx, iscallee)
 
     p = fb
     kids = children(node)
@@ -837,11 +885,10 @@ function walk_source(io::IO, node, pos::Int, src, callsite_map, idxend::Int,
             # a dotted callee passes the flag down, so `Base.Math.sin` stays quiet
             # all the way to the leaf
             childcallee = (i == calleeidx) || (iscallee && isdot)
-            p = walk_source(io, c, p, src, callsite_map, idxend, cfg, sparams, cm,
-                            offset, deadspans, childcallee)
+            p = walk_source(io, c, p, ctx, childcallee)
         end
     end
-    p <= lb && emit_code(io, src, p, lb, cm, offset)
+    p <= lb && emit_code(io, ctx.src, p, lb, ctx.classmap, ctx.offset)
 
     opened && print(io, "</span>")
     return lb + 1
@@ -868,15 +915,18 @@ uninteresting_const(@nospecialize(typ), iscallee::Bool) =
     iscallee && typ isa Core.Const &&
     (typ.val isa Function || typ.val isa Type || typ.val isa Module)
 
-function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
-                   cfg::CthulhuConfig, sparams::Dict{String,Any},
-                   deadspans::Set{Tuple{Int,Int}}, iscallee::Bool)
+function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Bool)
+    src, sparams = ctx.src, ctx.sparams
     typ = node.typ
+    # Under a macro with no callsite to confirm it, the mapping may have handed
+    # this range another statement's type. Better none than a wrong one.
+    (fb, lb) in ctx.unverified && (typ = nothing)
     # A callee whose annotation we deliberately drop is not an *untyped* node: it
     # must fall through to the enclosing call rather than raise a barrier.
     suppressed = typ !== nothing && uninteresting_const(typ, iscallee)
     suppressed && (typ = nothing)
-    nodeid = get(callsite_map, (fb, lb), 0)
+    cs = get(ctx.callsites, (fb, lb), nothing)
+    nodeid = cs === nothing ? 0 : cs.id
     runtime = try is_runtime(node) catch; false end
 
     # A `T` in the signature is plain source text with no inferred type. Bind it
@@ -890,7 +940,7 @@ function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
         end
     end
 
-    if (fb, lb) in deadspans
+    if (fb, lb) in ctx.dead
         # Grey the whole subtree, and say why on hover -- an unexplained grey
         # block reads as a rendering failure.
         print(io, "<span class=\"s s-dead\" data-type=\"",
@@ -918,7 +968,17 @@ function open_span(io::IO, node, fb::Int, lb::Int, src, callsite_map,
 
     classes = ["s"]
     issparam && push!(classes, "s-sparam")
-    if typ !== nothing && !issparam
+    if cs !== nothing
+        # This span IS a call, so report the type Cthulhu inferred for that call.
+        # The syntax node's own type comes from mapping IR statements onto source
+        # ranges, and that mapping goes wrong: under `@stable_muladdmul` the call
+        # node for `_modify2x2!(...)` carries `Core.Const(MulAddMul{...})` -- the
+        # type the macro's expansion constructs -- rather than the call's return
+        # type. Using the callsite's own `rt` also keeps this pane and the tree
+        # agreeing, which is how that mismatch was noticed in the first place.
+        typ = cs.rt
+        push!(classes, cs.unstable ? (cs.union ? "s-union" : "s-unstable") : "s-stable")
+    elseif typ !== nothing && !issparam
         if is_type_unstable(typ)
             push!(classes, is_expected_union_safe(typ) ? "s-union" : "s-unstable")
         else
