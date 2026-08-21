@@ -171,6 +171,48 @@ try
         @test_throws Exception HTTP.get("http://localhost:8766/"; retry=false)
     end
 
+    @testset "replacing a server does not wait on the open tab" begin
+        # `close(::HTTP.Server)` is graceful: it polls until every tracked
+        # connection is idle, and an attached browser's WebSocket never is. So
+        # re-running `descend_web` on a port a tab was watching sat inside
+        # `stop_web` until that tab was refreshed -- and the refresh landed in
+        # the gap between the two servers, which is the error the user saw
+        # before a second refresh finally worked. Measured before the fix: still
+        # blocked after 15s; `forceclose` returns in ~0.01s.
+        #
+        # The existing lifecycle test misses this because it re-runs with no
+        # client attached, which is the one case that was never broken.
+        f2(x) = sqrt(abs(x))
+        descend_web(f2, Tuple{Float64}; port=8794)
+        sleep(0.5)
+        held = Channel{Bool}(1)          # holds the socket open
+        client = Threads.@spawn try
+            HTTP.WebSockets.open("ws://localhost:8794/") do ws
+                first(ws)                # the init frame
+                take!(held)
+            end
+        catch
+        end
+        try
+            sleep(1.0)
+            t0 = time()
+            replaced = Threads.@spawn descend_web(f2, Tuple{Float64}; port=8794)
+            @test timedwait(() -> istaskdone(replaced), 20.0) === :ok
+            elapsed = time() - t0
+            @test elapsed < 10
+            println("  replaced a watched server in ", round(elapsed, digits=2), "s")
+            # and the replacement really serves
+            @test HTTP.get("http://localhost:8794/"; status_exception=false).status == 200
+            HTTP.WebSockets.open("ws://localhost:8794/") do ws
+                @test occursin("f2", JSON3.read(first(ws)).root.name)
+            end
+        finally
+            close(held)
+            stop_web(8794)
+        end
+        @test !haskey(SERVERS, 8794)
+    end
+
     @testset "serves before analysing" begin
         # Regression: the session used to be built before `HTTP.listen!`, so a
         # slow entry point (LinearAlgebra, big generic calls) made descend_web

@@ -218,11 +218,28 @@ function stop_web(port::Union{Nothing,Int} = nothing)
     for p in (port === nothing ? collect(keys(SERVERS)) : [port])
         srv = pop!(SERVERS, p, nothing)
         srv === nothing && continue
-        try close(srv) catch end
+        try shutdown_server(srv) catch end
         @info "Stopped Cthulhu web UI on port $p"
     end
     return nothing
 end
+
+"""
+Stop an `HTTP.Server` without waiting for its clients.
+
+`close(::HTTP.Server)` is documented as graceful: it stops accepting, then polls
+until every tracked connection is idle. An attached browser's WebSocket is never
+idle, so it never finishes. Measured with one client attached: `close` was still
+blocked after 15s, `forceclose` returned in 0.01s.
+
+That was the REPL hang. Running `descend_web` again reuses the port so the open
+tab keeps working (`pick_port`), which meant `stop_web` sat waiting on the very
+tab it was replacing -- the link only printed once the user refreshed, and that
+refresh landed in the window where the old server was down and the new one had
+not been created yet, which is the error they saw.
+"""
+shutdown_server(srv) =
+    isdefined(HTTP, :forceclose) ? HTTP.forceclose(srv) : close(srv)
 
 """
     @descend_web f(args...)

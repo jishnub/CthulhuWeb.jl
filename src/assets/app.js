@@ -9,7 +9,7 @@ const nodes = new Map();     // id -> record
 const childrenOf = new Map(); // id -> [ids]
 const expanded = new Set();
 let selected = null;
-let ws, reqSeq = 1;
+let ws, reqSeq = 1, retry = 0;
 const pending = new Map();   // req -> resolve
 
 const $ = (s) => document.querySelector(s);
@@ -19,12 +19,49 @@ const status = (t) => { $("#status").textContent = t || ""; };
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/`);
+  ws.onopen = () => { retry = 0; status(""); };
   ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
-  ws.onclose = () => status("disconnected");
-  ws.onerror = () => status("connection error");
+  ws.onclose = () => scheduleReconnect();
+  // onclose always follows onerror, so let one place own the retry
+  ws.onerror = () => {};
+}
+
+// Running `descend_web` again from the REPL replaces the server on this port so
+// that an open tab keeps working, which means a close here usually announces a
+// NEW session rather than the tool going away. Reconnect on a backoff instead of
+// making the user refresh -- and refresh twice, since the first one used to land
+// in the gap between the two servers.
+//
+// Give up after ~90s of silence: a tab left open after `stop_web()` should say
+// so rather than poll for the rest of the day.
+const RETRY_MS = [200, 400, 800, 1600, 3000];
+let retryTimer = null;
+function scheduleReconnect() {
+  if (retryTimer) return;
+  if (retry >= 40) { status("disconnected — reload to reconnect"); return; }
+  status("reconnecting…");
+  const delay = RETRY_MS[Math.min(retry, RETRY_MS.length - 1)];
+  retry++;
+  retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
+}
+
+// The tree on screen belongs to the session that just went away: its node ids
+// index a `Session` the new server does not have. Drop all of it before taking
+// anything from the new one.
+function resetSession() {
+  nodes.clear();
+  childrenOf.clear();
+  expanded.clear();
+  loadingNodes.clear();
+  pending.clear();
+  selected = null;
+  document.body.classList.remove("busy");
 }
 
 function send(op, extra = {}) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return Promise.resolve({ error: "not connected to the analysis server" });
+  }
   const req = reqSeq++;
   const p = new Promise((resolve) => {
     pending.set(req, resolve);
@@ -42,6 +79,7 @@ function onMessage(msg) {
   if (msg.op === "initializing") {
     // Server is up but the entry point is still being inferred. Say so instead
     // of showing an empty tree.
+    resetSession();
     $("#root-sig").textContent = "analysing…";
     document.body.classList.add("busy");
     showLoading("Analysing the entry point…");
@@ -52,7 +90,7 @@ function onMessage(msg) {
   }
   if (msg.op === "init") {
     clearLoading();
-    document.body.classList.remove("busy");
+    resetSession();
     nodes.set(msg.root.id, msg.root);
     $("#root-sig").textContent = msg.root.name;
     applyConfig(msg.config);
@@ -253,6 +291,7 @@ async function select(id, cameFrom = 0) {
   const res = await send("body", { id });
   clearLoading();
   if (selected !== id) return;          // superseded by a later click
+  if (res.error) { showError(res.error); return; }
   $("#code").innerHTML = res.html || `<p class="err">no output</p>`;
   wireSourceSpans();
   // When ascending, mark the call we just came back from so "where was I?" is
