@@ -538,6 +538,35 @@ function pick_callsite(s::Session, cands::Vector{Int}, sn, src,
 end
 
 """
+Does the source at this span name the function the callsite calls?
+
+Normally the question does not arise: a callsite comes back attached to the
+source node it was lowered from. When the result is optimized IR the attachment
+is by line number instead (see `distrust_body!`), and lands anywhere on the line
+-- in `m = n * 2 + length(string(n))` reached by semi-concrete evaluation,
+`string`'s callsite was attached to the `+`, so the addition was a click target
+for `string` and its tooltip read `::String`.
+
+Confirmation is the same identity match `pick_callsite` scores highest, with the
+callee's spelling as the fallback for a span that is not a call node -- an infix
+operator arrives as its own bare leaf.
+"""
+function names_this_callsite(s::Session, k::Int, sn, src, sparams::Dict{String,Any})
+    n = s.nodes[k]
+    v = callee_value(sn, src, sparams)
+    v === nothing || return callee_matches(n, v)
+    nm = callee_name(sn, src)
+    if nm === nothing && is_leaf(sn)
+        t = strip(String(src[first_byte(sn):last_byte(sn)]))
+        nm = isempty(t) ? nothing : String(t)
+    end
+    nm === nothing && return false
+    ctor = constructed_type(n)
+    names = ctor === nothing ? [n.label.name] : ctor_names(ctor)
+    return any(x -> x == nm || endswith(x, "." * nm), names)
+end
+
+"""
 Place callsites Cthulhu did not, where the source says unambiguously where.
 
 `f!(dest, parent(src))` in `copyto_unaliased!` gets no source node, so the call
@@ -808,6 +837,47 @@ function collect_unverified!(d::Set{Tuple{Int,Int}}, node, callsites, inmacro::B
 end
 
 """
+Every annotated span in a body that was not analysed as written.
+
+`optimize=false` is a request the provider need not honour. A semi-concretely
+evaluated call is analysed as already-optimized IR, and `lookup` hands that back
+whatever we ask for (`result.optimized` is then true). `get_typed_sourcetext`
+maps those statements onto the source BY LINE NUMBER
+(`append_targets_for_line!`, TypedSyntax/src/node.jl), and every statement
+inlined into a call carries the line of the call that inlined it -- so a
+callee's statement can be reported as the calling expression's type.
+
+Measured: in ApproxFunBase's `view(A::Operator, ::Type{FiniteRange}, jr)`, the
+tail call `view(A,1:cs,jr)` was annotated `::Tuple{Int64, Int64}` -- a size tuple
+from inside the `SubOperator` inlined into it -- where the call returns a Union
+of two `SubOperator`s, and `1:cs` was annotated `::Int64`.
+
+Nothing in the result separates a real mapping from a coincidence, so the whole
+body annotation goes. What survives is what does not come from the mapping: the
+signature (`slottypes`), static parameters, the method's return type, and the
+callsites Cthulhu located itself.
+"""
+function distrust_body!(d::Set{Tuple{Int,Int}}, node, callsites)
+    fb, lb = first_byte(node), last_byte(node)
+    node.typ === nothing || haskey(callsites, (fb, lb)) || push!(d, (fb, lb))
+    kids = children(node)
+    kids === nothing || for c in kids
+        distrust_body!(d, c, callsites)
+    end
+    return d
+end
+
+"Note for a body rendered without annotation because the code analysed was not
+the code shown. See `distrust_body!`."
+inlined_note(node::Node) =
+    "<p class=\"note\">Cthulhu analysed this call as already-optimized code (" *
+    html_escape(string(node.label.kind)) * "), so the statements it inferred are " *
+    "no longer this method's own -- an inlined callee's statement carries the " *
+    "line of the call that inlined it. The body is left unannotated rather than " *
+    "annotated with a guess; the arguments, the calls Cthulhu located, and the " *
+    "return type <code>" * html_escape(node.label.rt) * "</code> still hold.</p>"
+
+"""
     source_html(session, node, cfg) -> String
 
 Render the node's source with nested `<span>`s carrying inferred types, and
@@ -860,6 +930,15 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
             for (key, ks) in cands
                 k = pick_callsite(s, ks, spannode[key], tsn.source,
                                   get(spantypes, key, nothing), sparams)
+                # An optimized result attaches callsites by line, not by
+                # provenance, so a span can be handed a call it does not name.
+                # Keep only what the source confirms; the rest fall back to the
+                # unlocated list, where they are at least honestly placed.
+                if result.optimized && !names_this_callsite(s, k, spannode[key],
+                                                            tsn.source, sparams)
+                    append!(unplaced, ks)
+                    continue
+                end
                 l = s.nodes[k].label
                 # Carry Cthulhu's own return type for the callsite, not just the
                 # id. See `open_span`: for a call the two can disagree, and the
@@ -908,14 +987,21 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     # `kwshim(v; width = eltype(v) <: Complex ? 512 : 256)` is untyped in the
     # shim's own IR, which is an artefact of where the code lives, not evidence
     # that anything was compiled out.
+    #
+    # It also reads "no type" as "never reached", which holds only where a missing
+    # type means inference did not get there. When the result came back optimized
+    # the mapping is line-based and lossy (see `distrust_body!`), so a missing
+    # type means nothing at all and nothing may be marked.
     deadspans = Set{Tuple{Int,Int}}()
     unmapped = !truncated && nothing_mapped(body) && body !== nothing && has_call(body)
-    truncated || unmapped || collect_dead!(deadspans, body)
+    inlined = !truncated && !unmapped && result.optimized && body !== nothing
+    truncated || unmapped || inlined || collect_dead!(deadspans, body)
 
     src = tsn.source
     startb = first_byte(tsn)
-    ctx = RenderCtx(src, callsite_map, deadspans,
-                    collect_unverified!(Set{Tuple{Int,Int}}(), tsn, callsite_map, false),
+    unverified = collect_unverified!(Set{Tuple{Int,Int}}(), tsn, callsite_map, false)
+    inlined && distrust_body!(unverified, body, callsite_map)
+    ctx = RenderCtx(src, callsite_map, deadspans, unverified,
                     collect_unowned!(unowned, tsn),
                     sparams, token_classmap(src, startb, idxend), startb, idxend)
     io = IOBuffer()
@@ -929,7 +1015,8 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     file = node.label.file === nothing ? "" :
         "<div class=\"srcfile\">" * html_escape(node.label.file) * "</div>"
     note = truncated ? truncated_note(s, node, kids) :
-           unmapped  ? unmapped_note(node) : ""
+           unmapped  ? unmapped_note(node) :
+           inlined   ? inlined_note(node) : ""
 
     # A truncated shim already links its body method, and every other callsite it
     # has is lowering; listing them there would only repeat and clutter.

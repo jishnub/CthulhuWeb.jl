@@ -11,7 +11,8 @@ using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ans
                   headless_config, lookup_cached!, node_record, render_body,
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
-                  has_call, has_typeable, names_in_source, nothing_mapped,
+                  has_call, has_typeable, names_in_source,
+                  names_this_callsite, nothing_mapped,
                   source_tokens,
                   unique_callsites,
                   source_html, static_params, token_classmap
@@ -192,6 +193,16 @@ function span_content(html::AbstractString, id::Int)
     end
     return html[i:end]
 end
+
+# Semi-concrete evaluation: `n` is constant and the method is foldable, but the
+# result is not, so inference runs the OPTIMIZER over it and Cthulhu hands back
+# already-inlined IR. The body then has more statements than it has source, and
+# they map back onto it by line number alone.
+Base.@assume_effects :foldable function scbody(n::Int, x::Float64)
+    m = n * 2 + length(string(n))
+    return x + m
+end
+sccaller(x::Float64) = scbody(3, x)
 
 "Plain text of each `.s-dead` region, in order -- what a reader sees faded."
 function dead_regions(html::AbstractString)
@@ -702,6 +713,54 @@ end
     @test !has_call(ps("()"))
     @test has_call(ps("f(g(x))"))
     @test nothing_mapped(nothing)
+end
+
+@testset "a body analysed after inlining is not annotated from the leftovers" begin
+    # `optimize=false` is a request the provider need not honour. A semi-concrete
+    # result is optimized IR, and `get_typed_sourcetext` maps its statements onto
+    # the source by LINE NUMBER, so a statement inlined into a call is reported as
+    # that call's type. Found in ApproxFunBase's
+    # `view(A::Operator, ::Type{FiniteRange}, jr)`, whose tail call was annotated
+    # `::Tuple{Int64, Int64}` -- a size tuple from inside the `SubOperator` it
+    # constructs -- where the call returns a Union of two `SubOperator`s.
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    scmi = find_method_instance(provider, sccaller, Tuple{Float64})
+    @test scmi !== nothing
+    s = Session(provider, scmi; config=cfg)
+    kids = expand!(s, ROOT_ID; optimize=false)
+    i = findfirst(k -> s.nodes[k].label.kind === :semiconcrete, kids)
+    @test i !== nothing
+    node = s.nodes[kids[i]]
+    @test lookup_cached!(s, node, false).optimized
+    html = source_html(s, node, cfg)
+    @test html !== nothing
+    @test occursin("already-optimized code", html)
+
+    # the signature still carries types -- those come from `slottypes`, not from
+    # the mapping -- and so does the method's return type
+    @test occursin("data-type=\"::Core.Const(3)\"", html)
+    @test occursin("data-type=\"::Float64\"", html)
+    # ...but nothing in the body does
+    code = replace(html, r"^.*<pre class=\"code src\">"s => "", r"</pre></div>.*$"s => "")
+    body = code[something(findfirst("\n", code)).start:end]   # past the signature line
+    @test !occursin("data-type", body)
+    # in particular not the two that were wrong: `string`'s callsite had been
+    # attached to the `+` (reporting `::String` for an `Int64` addition) and
+    # `length`'s to the `*`
+    @test !occursin("::String", code)
+    @test !occursin("data-node-id", body)
+    # and no dead-code marking: with a line-based mapping, an untyped node is not
+    # evidence of anything
+    @test !occursin("s-dead", html)
+
+    # the calls are not lost, only honestly relocated
+    @test occursin("unlocated", html)
+    @test occursin("length(::String)", html)
+
+    # a placement the source DOES name survives the same gate
+    @test names_this_callsite(s, kids[i], JuliaSyntax.parsestmt(JuliaSyntax.SyntaxNode,
+                                                                "scbody(3, x)"),
+                              "scbody(3, x)", Dict{String,Any}())
 end
 
 @testset "a call span reports the callsite's return type" begin
