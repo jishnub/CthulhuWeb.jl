@@ -648,15 +648,22 @@ through as a `::typeof(f)` argument; showing that verbatim is unreadable, so
 recover the plain name and drop the plumbing argument.
 """
 function body_label(n::Node)
-    name = n.label.name
+    name = tidy(n.label.name)
     m = match(r"var\"#+([^#\"]+)#\d+\"$", name)
     m === nothing || (name = String(m.captures[1]))
-    args = [a for a in n.label.argtypes if !startswith(a, "typeof(")]
+    args = [tidy(a) for a in n.label.argtypes if !startswith(a, "typeof(")]
     args = [length(a) > 40 ? first(a, 37) * "…" : a for a in args]
     sig = join(["::" * a for a in args], ", ")
-    isempty(n.label.kwargs) || (sig *= "; " * join(n.label.kwargs, ", "))
+    isempty(n.label.kwargs) || (sig *= "; " * join(tidy.(n.label.kwargs), ", "))
     return name * "(" * sig * ")"
 end
+
+"""
+A type or name as one line of text: leading and trailing space gone, internal
+runs (a line break inside a long parametric type) collapsed to a single space.
+These land in buttons, where stray whitespace shows as an indent.
+"""
+tidy(x::AbstractString) = strip(replace(x, r"\s+" => " "))
 
 """
 Note shown for a method that only fills in default arguments (or forwards keyword

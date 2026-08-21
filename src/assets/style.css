@@ -109,8 +109,14 @@ pre.code { margin: 0; white-space: pre; overflow-x: auto; tab-size: 4; }
 .note.unlocated { margin-top: .75rem; margin-bottom: .25rem; }
 .unlocated-list { list-style: none; margin: 0; padding: 0; }
 .unlocated-list li { margin: .25rem 0; }
-/* the list stacks, so the inline nudge the shim links carry is wrong here */
-.unlocated-list .bodylink { margin-left: 0; }
+/* The list stacks, so the pill styling that suits an inline link just insets
+   every entry behind its own border and padding. Flush left, so the labels line
+   up with the sentence above them. */
+.unlocated-list .bodylink {
+  margin-left: 0; padding-left: 0; padding-right: 0;
+  background: none; border: none;
+}
+.unlocated-list .bodylink:hover { background: none; text-decoration: underline; }
 .err  { color: var(--red); white-space: pre-wrap; }
 
 /* ANSI SGR classes emitted by ansi_to_html */

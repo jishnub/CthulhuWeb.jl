@@ -751,6 +751,15 @@ end
     @test length(unique_callsites(ms, dupes)) ==
           length(unique(ms.nodes[k].mi for k in dupes))
 
+    # entries are one clean line each: no leading indent, no internal breaks
+    for m in eachmatch(r"<button[^>]*>([^<]*)</button>", html)
+        @test m.captures[1] == strip(m.captures[1])
+        @test !occursin(r"\s\s|\n", m.captures[1])
+    end
+    # ...and the list is flush left rather than inset behind the button padding
+    css2 = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "style.css"), String)
+    @test occursin(r"\.unlocated-list \.bodylink \{[^}]*padding-left: 0", css2)
+
     # one <li> per call, so several never run together into one wrapped blob
     @test occursin("<ul class=\"unlocated-list\">", note.match)
     @test length(collect(eachmatch(r"<li>", note.match))) ==
