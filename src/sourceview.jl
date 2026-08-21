@@ -561,6 +561,29 @@ function source_tokens(text::AbstractString)
 end
 
 """
+Distinct callsites, keyed on MethodInstance.
+
+`_mul!` tests `tA_uc` and `tB_uc` against six different characters, and each of
+those is a separate callsite of the same `==(::Char, ::Char)`. Six identical
+lines say nothing the first one did not.
+
+Nodes without a MethodInstance -- a union split, a runtime dispatch -- fall back
+to their printed signature, which is what distinguishes them in the tree too.
+"""
+function unique_callsites(s::Session, ids::Vector{Int})
+    out, seen = Int[], Set{Any}()
+    for k in ids
+        n = s.nodes[k]
+        key = n.mi === nothing ?
+            (n.label.name, n.label.argtypes, n.label.kwargs) : n.mi
+        key in seen && continue
+        push!(seen, key)
+        push!(out, k)
+    end
+    return out
+end
+
+"""
 Callsites Cthulhu could not place in the source, listed rather than dropped.
 
 The source pane is a view of the call tree, and silently omitting a call the
@@ -625,7 +648,7 @@ function truncated_note(s::Session, node::Node, kids::Vector{Int})
     # pane is never a dead end even when the heuristic misses
     body = node.mi === nothing ? Int[] :
            [k for k in cand if is_body_method(node.mi, s.nodes[k].mi)]
-    targets = isempty(body) ? cand : body
+    targets = unique_callsites(s, isempty(body) ? cand : body)
     if isempty(targets)
         # Say what actually happened rather than pointing at a body method that
         # is not there: from here the user has nowhere to click and no reason.
@@ -750,9 +773,10 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     # has is lowering; listing them there would only repeat and clutter.
     shown = truncated ? Set{String}() :
         source_tokens(String(src[startb:min(idxend, lastindex(src))]))
-    unlocated = [k for k in unplaced
-                 if (s.nodes[k].descendable || s.nodes[k].expandable) &&
-                    names_in_source(s.nodes[k], shown)]
+    unlocated = unique_callsites(s,
+        [k for k in unplaced
+         if (s.nodes[k].descendable || s.nodes[k].expandable) &&
+            names_in_source(s.nodes[k], shown)])
     tail = unlocated_note(s, unlocated)
 
     sp = isempty(sparams) ? "" :

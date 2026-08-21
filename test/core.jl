@@ -12,6 +12,7 @@ using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ans
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
                   has_call, names_in_source, nothing_mapped, source_tokens,
+                  unique_callsites,
                   source_html, static_params, token_classmap
 
 f() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
@@ -669,6 +670,23 @@ end
     note = match(r"<p class=\"note unlocated\">.*?</ul>"s, html)
     @test note !== nothing
     @test occursin("unlocatable_helper", note.match)
+    # the same MethodInstance reached from several folded callsites is listed
+    # once: `_mul!` tests two chars against six literals, all `==(::Char, ::Char)`
+    mmi = find_method_instance(provider, LinearAlgebra._mul!,
+              Tuple{Matrix{Float64}, Matrix{Float64}, Matrix{Float64}, Bool, Bool})
+    ms = Session(provider, mmi; config=cfg)
+    mnote = match(r"<p class=\"note unlocated\">.*?</ul>"s,
+                  something(source_html(ms, ms.nodes[ROOT_ID], cfg), ""))
+    if mnote !== nothing
+        listed = [m.captures[1] for m in eachmatch(r"<button[^>]*>([^<]*)</button>", mnote.match)]
+        @test length(listed) == length(unique(listed))
+    end
+    # ...and the helper it goes through keys on the MethodInstance
+    dupes = [k for k in expand!(ms, ROOT_ID; optimize=false)
+             if ms.nodes[k].mi !== nothing]
+    @test length(unique_callsites(ms, dupes)) ==
+          length(unique(ms.nodes[k].mi for k in dupes))
+
     # one <li> per call, so several never run together into one wrapped blob
     @test occursin("<ul class=\"unlocated-list\">", note.match)
     @test length(collect(eachmatch(r"<li>", note.match))) ==
