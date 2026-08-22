@@ -130,13 +130,19 @@ end
 # compiled-out `elseif uplo == 'L'`.
 Base.@constprop :aggressive function twowrite!(A::Matrix{Float64}, up::Bool)
     if up
-        A[1,2] = float(length(A))
+        A[1,2] = 2 * A[2,1]
     else
-        A[2,1] = float(length(A))
+        A[2,1] = 2 * A[1,2]
     end
     return A
 end
 twowritecaller(A::Matrix{Float64}) = twowrite!(A, true)
+
+# ...and the same method with nothing folded: two live reads and two live
+# writes, none of which the source distinguishes by name. The pairing is not
+# forced by the data, so nothing may be placed.
+bothlive!(A::Matrix{Float64}, up::Bool) = up ? (A[1,2] = 2*A[2,1]) : (A[2,1] = 2*A[1,2])
+bothlivecaller(A::Matrix{Float64}, up::Bool) = bothlive!(A, up)
 
 # A ternary whose test folds away -- the shape of `copytri!`'s
 # `conjugate ? adjoint(A[i,j]) : transpose(A[i,j])`, where `conjugate` arrives as
@@ -790,8 +796,10 @@ end
     @test wnode.label.kind === :constprop
     kids2 = expand!(w, wkids[wi]; optimize=false)
     si = findfirst(k -> w.nodes[k].label.name == "setindex!", kids2)
+    gi = findfirst(k -> w.nodes[k].label.name == "getindex", kids2)
     @test si !== nothing
-    sid = kids2[si]
+    @test gi !== nothing
+    sid, gid = kids2[si], kids2[gi]
 
     html = source_html(w, wnode, cfg)
     @test html !== nothing
@@ -805,6 +813,31 @@ end
     # `a[i] = v` evaluates to `v`, not to what `setindex!` returns, so the span
     # takes the click without claiming a type.
     @test !occursin("data-type", split(placed, "<span")[1])
+
+    # The read is a call the source does not name either -- but its value IS
+    # the call's result, so unlike the write it keeps its annotation.
+    @test occursin("data-node-id=\"$gid\"", html)
+    readspan = span_content(html, gid)
+    @test replace(readspan, r"<[^>]*>" => "") == "A[2,1]"
+    @test occursin(Regex("data-type=\"::Float64\"[^>]*data-node-id=\"$gid\""), html)
+
+    # Nothing folded: two reads and two writes, and the source names none of
+    # them. The pairing is not forced by the data, so none is placed -- a
+    # guessed span would be worse than no span.
+    bmi = find_method_instance(provider, bothlivecaller, Tuple{Matrix{Float64},Bool})
+    b = Session(provider, bmi; config=cfg)
+    bkids = expand!(b, ROOT_ID; optimize=false)
+    bi = findfirst(k -> b.nodes[k].label.name == "bothlive!", bkids)
+    @test bi !== nothing
+    bkids2 = expand!(b, bkids[bi]; optimize=false)
+    idx = [k for k in bkids2 if b.nodes[k].label.name in ("getindex", "setindex!")]
+    @test length(idx) == 4
+    bhtml = source_html(b, b.nodes[bkids[bi]], cfg)
+    @test bhtml !== nothing
+    @test !occursin("s-dead", bhtml)
+    for k in idx
+        @test !occursin("data-node-id=\"$k\"", bhtml)
+    end
 end
 
 @testset "a body inference never annotated is explained, not greyed" begin

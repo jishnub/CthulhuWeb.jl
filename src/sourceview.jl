@@ -617,9 +617,10 @@ callsite dispatches on `typeof(adjoint!)`, which is the same identity match
 Searched in the body only -- a method's own signature is a `call` node whose
 callee is the method itself, and would tie with any recursive call.
 
-Assignment counts as a call: `B[j,i] = f(A[i,j])` in `transpose_f!` is a
-`setindex!` that Cthulhu locates nowhere and whose name the source never says,
-so it was invisible in the pane by both routes.
+Indexing counts as a call, in both directions: `B[j,i] = f(A[i,j])` in
+`transpose_f!` is a `setindex!` and the `A[i,j]` is a `getindex`, neither of
+which Cthulhu locates and neither of which the source names, so they were
+invisible in the pane by both routes.
 
 Required unique in both directions: one unmapped call node whose callee is this
 function, and one unmapped callsite for that node. `_modify2x2!` under
@@ -638,6 +639,7 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
                           dead::Set{Tuple{Int,Int}} = Set{Tuple{Int,Int}}())
     isempty(unplaced) && return unplaced
     nodes = Any[]
+    written = Set{Tuple{Int,Int}}()
     unmapped(nd) = !haskey(callsite_map, (first_byte(nd), last_byte(nd)))
     function scan(nd)
         # `dead` holds outermost regions, so this prunes the whole subtree
@@ -653,10 +655,26 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
         # the right-hand side -- so the span covers it all, exactly as `f(x)`
         # covers its arguments.
         kids = children(nd)
-        if k === K"=" && kids !== nothing && length(kids) == 2 && unmapped(nd)
+        if k === K"=" && kids !== nothing && length(kids) == 2
             lk = kind(kids[1])
-            fn = lk === K"ref" ? setindex! : lk === K"." ? setproperty! : nothing
-            fn === nothing || push!(nodes, (fn, nd))
+            # `A[i] = v` reads nothing through `A[i]`: that span is the write.
+            # Recorded before descending, so the `ref` below sees it.
+            lk === K"ref" && push!(written, (first_byte(kids[1]), last_byte(kids[1])))
+            if unmapped(nd)
+                fn = lk === K"ref" ? setindex! : lk === K"." ? setproperty! : nothing
+                fn === nothing || push!(nodes, (fn, nd))
+            end
+        end
+        # And so is a read through `[]`: `A[i,j]` is `getindex(A, i, j)`, whose
+        # name the source says no more than it says `setindex!`. Unlike the
+        # assignment, the span's value IS the call's result, so it keeps the
+        # annotation as an ordinary call does.
+        #
+        # `A[i] += 1` is deliberately included: the read really does happen
+        # there. Only the bare `=` target is excluded.
+        if k === K"ref" && unmapped(nd) &&
+                !((first_byte(nd), last_byte(nd)) in written)
+            push!(nodes, (getindex, nd))
         end
         kids === nothing || foreach(scan, kids)
     end
@@ -664,13 +682,14 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
     isempty(nodes) && return unplaced
 
     left = Int[]
+    matches(n, v, nd) = callee_matches(n, v) && arity_matches(n, nd)
     for k in unplaced
         n = s.nodes[k]
-        hits = [nd for (v, nd) in nodes if callee_matches(n, v)]
+        hits = [nd for (v, nd) in nodes if matches(n, v, nd)]
         length(hits) == 1 || (push!(left, k); continue)
         target = hits[1]
         claimants = count(unplaced) do j
-            any(((v, nd),) -> nd === target && callee_matches(s.nodes[j], v), nodes)
+            any(((v, nd),) -> nd === target && matches(s.nodes[j], v, nd), nodes)
         end
         claimants == 1 || (push!(left, k); continue)
         rng = (first_byte(target), last_byte(target))
@@ -683,6 +702,32 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
                              unstable = l.unstable, union = l.expected_union)
     end
     return left
+end
+
+"""
+Does this indexing form take as many arguments as this callsite?
+
+`A[i]` and `A[i,j]` are both `getindex`, and the callee alone cannot tell them
+apart -- so in any method with more than one index read, every read tied with
+every other and none was placed. The count can: a `ref` with N children is a
+call with N arguments, and `lhs = rhs` is that plus the value.
+
+Only the forms `place_by_callee!` invents are counted. A written-out `f(x)` is
+matched by its callee, which is already specific, and counting there would only
+add ways to be wrong. A splat has no fixed count, so it is left to the callee
+match alone.
+"""
+function arity_matches(n::Node, nd)
+    k = kind(nd)
+    (k === K"ref" || k === K"=") || return true
+    kids = children(nd)
+    kids === nothing && return true
+    target = k === K"ref" ? nd : kids[1]
+    tkids = children(target)
+    tkids === nothing && return true
+    any(c -> kind(c) === K"...", tkids) && return true
+    want = k === K"ref" ? length(tkids) : length(tkids) + 1
+    return want == length(n.label.argtypes)
 end
 
 """
