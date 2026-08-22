@@ -641,15 +641,31 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
     isempty(unplaced) && return unplaced
     nodes = Any[]
     written = Set{Tuple{Int,Int}}()
-    unmapped(nd) = !haskey(callsite_map, (first_byte(nd), last_byte(nd)))
+    calleespans = Set{Tuple{Int,Int}}()
+    rng(nd) = (first_byte(nd), last_byte(nd))
+    unmapped(nd) = !haskey(callsite_map, rng(nd))
     function scan(nd)
         # `dead` holds outermost regions, so this prunes the whole subtree
-        (first_byte(nd), last_byte(nd)) in dead && return
+        rng(nd) in dead && return
         k = kind(nd)
-        if (k === K"call" || k === K"dotcall") && unmapped(nd)
-            v = callee_value(nd, src, sparams)
-            v === nothing || push!(nodes, (v, nd))
+        if k === K"call" || k === K"dotcall"
+            # A callee is a name being resolved, not a value being read out of
+            # something. `LAPACK.gesdd!(x)` does lower to a
+            # `getproperty(LAPACK, :gesdd!)`, but that is the name resolution
+            # `is_name_resolution` already keeps out of the click map, not a
+            # property access worth pointing at. Recorded before descending, so
+            # the `.` below sees it -- and passed down, since `Base.Math.sin`
+            # nests.
+            ck = children(nd)
+            ck === nothing || isempty(ck) || push!(calleespans, rng(ck[1]))
+            if unmapped(nd)
+                v = callee_value(nd, src, sparams)
+                v === nothing || push!(nodes, (v, nd))
+            end
         end
+        k === K"." && rng(nd) in calleespans &&
+            (ck = children(nd); ck === nothing || isempty(ck) ||
+             push!(calleespans, rng(ck[1])))
         # Assignment is a call too, and one the source never names: `B[j,i] = v`
         # is `setindex!(B, v, j, i)`, `x.f = v` is `setproperty!`. The whole
         # statement is the call -- its arguments are the target, the indices and
@@ -672,8 +688,8 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
             # `A[i] = v` reads nothing through `A[i]`: that span is the write.
             # Recorded before descending, so the `ref` below sees it. `A[i] *= v`
             # is not recorded -- it really does read before it writes.
-            lk === K"ref" && k === K"=" &&
-                push!(written, (first_byte(kids[1]), last_byte(kids[1])))
+            (lk === K"ref" || lk === K"." ) && k === K"=" &&
+                push!(written, rng(kids[1]))
             # Offered whether or not the range is already taken. In
             # `rmul!(::AbstractArray, ::Number)` the whole of `X[I] *= s` is
             # Cthulhu's span for the `*`, so the `setindex!` can never own it --
@@ -703,10 +719,21 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
         #
         # `A[i] += 1` is deliberately included: the read really does happen
         # there. Only the bare `=` target is excluded.
-        if k === K"ref" && unmapped(nd) &&
-                !((first_byte(nd), last_byte(nd)) in written)
+        if k === K"ref" && unmapped(nd) && !(rng(nd) in written)
             push!(nodes, (getindex, nd))
         end
+        # `x.f` is `getproperty(x, :f)` on the same terms -- a call the source
+        # performs and does not name, whose value is the span's own. 126 of them
+        # were dropped from the corpus for want of a form to recognise.
+        if k === K"." && unmapped(nd) &&
+                !(rng(nd) in written) && !(rng(nd) in calleespans)
+            push!(nodes, (getproperty, nd))
+        end
+        # A `for` header calls `iterate` twice -- once to start, once per step --
+        # and names neither. Cthulhu places the first on the header, so the
+        # second has no span left to take and was dropped; with both offered the
+        # same one node they tie, which is what lists them.
+        k === K"iteration" && push!(nodes, (iterate, nd))
         kids === nothing || foreach(scan, kids)
     end
     scan(tsn)
@@ -729,14 +756,17 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
             any(((v, nd),) -> nd === target && matches(s.nodes[j], v, nd), nodes)
         end
         claimants == 1 || (push!(left, k); continue)
-        rng = (first_byte(target), last_byte(target))
-        haskey(callsite_map, rng) && (push!(left, k); continue)
+        # NOT `rng`: that name is the helper above, and assigning it here would
+        # rebind the closure `unmapped` calls -- silently, from the second
+        # placement on, taking every later one down with it.
+        trng = (first_byte(target), last_byte(target))
+        haskey(callsite_map, trng) && (push!(left, k); continue)
         # `a[i] = v` evaluates to `v`, not to what `setindex!` returns, so the
         # statement gets the click but not the annotation. Nor does `a[i] *= v`
         # evaluate to it.
-        kind(target) in (K"=", K"op=") && push!(unowned, rng)
+        kind(target) in (K"=", K"op=") && push!(unowned, trng)
         l = n.label
-        callsite_map[rng] = (id = k, rt = l.rt,
+        callsite_map[trng] = (id = k, rt = l.rt,
                              unstable = l.unstable, union = l.expected_union)
     end
     return left
@@ -757,15 +787,15 @@ match alone.
 """
 function arity_matches(n::Node, nd)
     k = kind(nd)
-    (k === K"ref" || k === K"=" || k === K"op=") || return true
+    (k === K"ref" || k === K"." || k === K"=" || k === K"op=") || return true
     kids = children(nd)
     kids === nothing && return true
-    target = k === K"ref" ? nd : kids[1]
+    target = (k === K"ref" || k === K".") ? nd : kids[1]
     kind(target) === K"tuple" && return true   # several writes, no single count
     tkids = children(target)
     tkids === nothing && return true
     any(c -> kind(c) === K"...", tkids) && return true
-    want = k === K"ref" ? length(tkids) : length(tkids) + 1
+    want = (k === K"ref" || k === K".") ? length(tkids) : length(tkids) + 1
     return want == length(n.label.argtypes)
 end
 
@@ -1192,9 +1222,12 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     # has is lowering; listing them there would only repeat and clutter.
     shown = truncated ? Set{String}() :
         source_tokens(String(src[startb:min(idxend, lastindex(src))]))
+    # `is_name_resolution` is the same judgement the click map makes: resolving
+    # `LAPACK.gesdd!` is not a call the reader wants, whichever route reached it.
     unlocated = unique_callsites(s,
         [k for k in unplaced
          if (s.nodes[k].descendable || s.nodes[k].expandable) &&
+            !is_name_resolution(s.nodes[k]) &&
             (k in recognised || names_in_source(s.nodes[k], shown))])
     tail = unlocated_note(s, unlocated)
 

@@ -854,6 +854,47 @@ end
     end
     @test occursin(">setindex!(::Matrix{Float64}, ::Float64, ::Int64, ::Int64)<", whtml)
     @test occursin(">getindex(::Matrix{Float64}, ::Int64, ::Int64)<", whtml)
+
+    # A `for` header calls `iterate` twice -- once to start, once per step --
+    # and names neither. Cthulhu places the first on the header, so the second
+    # had no span left to take and was dropped.
+    it1 = only(k for k in wkids if w.nodes[k].label.name == "iterate" &&
+                                   length(w.nodes[k].label.argtypes) == 1)
+    it2 = only(k for k in wkids if w.nodes[k].label.name == "iterate" &&
+                                   length(w.nodes[k].label.argtypes) == 2)
+    @test occursin("data-node-id=\"$it1\"", wcode)
+    @test !occursin("data-node-id=\"$it2\"", wcode)
+    @test occursin(">iterate(::Base.OneTo{Int64}, ::Int64)<", whtml)
+
+    # `x.f` is `getproperty(x, :f)` on the same terms. `eigencopy_oftype` reads
+    # `A.uplo` more often than Cthulhu finds spans for it.
+    emi = find_method_instance(provider, LinearAlgebra.eigencopy_oftype,
+                               Tuple{LinearAlgebra.Symmetric{Float64,Matrix{Float64}},
+                                     Type{Float64}})
+    @test emi !== nothing
+    e = Session(provider, emi; config=cfg)
+    ekids = expand!(e, ROOT_ID; optimize=false)
+    gps = [k for k in ekids if e.nodes[k].label.name == "getproperty"]
+    @test length(gps) > 1
+    ehtml = source_html(e, e.nodes[ROOT_ID], cfg)
+    @test ehtml !== nothing
+    ecode = code_region(ehtml)
+    @test any(k -> occursin("data-node-id=\"$k\"", ecode), gps)    # one has a span
+    @test any(k -> !occursin("data-node-id=\"$k\"", ecode), gps)   # another has none
+    # the label truncates a long argtype, so match the part that identifies it
+    @test occursin("getproperty(::LinearAlgebra.Symmetric", ehtml)
+
+    # Resolving a qualified name is not a call the reader wants, whichever route
+    # reaches it: `Core.sizeof(x)` holds a `getproperty(::Module, ::Symbol)`
+    # that the click map already drops, and the list must drop it too.
+    zmi = find_method_instance(provider, sizeof, Tuple{Type{Float64}})
+    @test zmi !== nothing
+    z = Session(provider, zmi; config=cfg)
+    zkids = expand!(z, ROOT_ID; optimize=false)
+    @test any(k -> z.nodes[k].label.argtypes == ["Module", "Symbol"], zkids)
+    zhtml = source_html(z, z.nodes[ROOT_ID], cfg)
+    @test zhtml !== nothing
+    @test !occursin("getproperty(::Module", zhtml)
 end
 
 @testset "a destructuring assignment is not typed by one of its parts" begin
@@ -1103,7 +1144,11 @@ end
     # `B[j, i] = A[i, j]` is a setindex!: no call node in the source, no name in
     # the text, but the assignment is unambiguously where it goes
     @test "setindex!" in linked
-    @test !occursin("note unlocated", html)
+    # The one call left over is the loop-continuation `iterate`: it shares the
+    # header with the `iterate` Cthulhu placed and has no span of its own, so it
+    # is listed rather than dropped. Nothing else is unaccounted for.
+    @test occursin(">iterate(::Base.OneTo{Int64}, ::Int64)<", html)
+    @test length(collect(eachmatch(r"<li><button", html))) == 1
 
     # the span covers the whole statement, as `f(x)` covers its arguments --
     # `setindex!(B, A[i,j], j, i)` takes the right-hand side as an argument
