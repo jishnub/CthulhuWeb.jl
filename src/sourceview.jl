@@ -903,27 +903,50 @@ struct RenderCtx
 end
 
 """
-Call nodes under a macro that Cthulhu did not place.
+Spans one source range shares with several IR statements, so the type the
+mapping picked for it is one of them rather than the range's own.
 
-A macro can expand one source range into several IR statements -- under
+A macro is one way in: it can expand one range into several statements -- under
 `@stable_muladdmul`, `_modify2x2!(...)` becomes a call in each of two branches --
-so whichever type the mapping picks for that range is arbitrary. It picked the
-`MulAddMul{...}` the expansion constructs, and hovering the call reported a type
-object where the call returns `Any`.
+so whichever type the mapping picks is arbitrary. It picked the `MulAddMul{...}`
+the expansion constructs, and hovering the call reported a type object where the
+call returns `Any`.
 
 Where a callsite IS placed we take Cthulhu's return type and the question does
 not arise; where none is and a macro could have multiplied the mapping, the
 honest answer is no type at all. Outside macros the mapping is one-to-one, so
 unplaced calls -- `sub_int`, `getfield`, the intrinsics, 1555 of them across the
 corpus against 81 here -- keep their annotations.
+
+Destructuring is the other way in, and needs no macro. `X′, Y′ = _subadd!!(X, Y)`
+in `tanh(::AbstractMatrix)` lowers to an `indexed_iterate` per name plus a
+`getfield` each, all on that one line, and the mapping handed the `=` range one
+of them: the whole statement was annotated `::Matrix{Float64}`. That is a
+component's type. The assignment's own value is the right-hand side, the
+`Tuple{Matrix{Float64}, Matrix{Float64}}` already shown on the call -- and
+nothing distinguishes the two, so the span reports neither. Every other
+assignment in the method is untyped and renders as a barrier; this one was
+reporting a type for the comma and the `=` sign.
 """
 function collect_unverified!(d::Set{Tuple{Int,Int}}, node, callsites, inmacro::Bool)
     k = kind(node)
+    kids = children(node)
     if inmacro && (k === K"call" || k === K"dotcall") && node.typ !== nothing &&
        !haskey(callsites, (first_byte(node), last_byte(node)))
         push!(d, (first_byte(node), last_byte(node)))
+    elseif k === K"=" && kids !== nothing && length(kids) == 2 &&
+           kind(kids[1]) === K"tuple"
+        # Both halves, for the same reason. The right-hand side is handed
+        # `indexed_iterate`'s `(element, state)` rather than its own return:
+        # `_subadd!!(X, Y)` reads `Tuple{Matrix{Float64}, Int64}` where the call
+        # returns two matrices, and `reim(z)` reads `Tuple{Float64, Int64}`
+        # where it returns two Floats. A placed callsite overrides this and is
+        # believed; where none is placed there is nothing left to check it
+        # against.
+        node.typ === nothing || push!(d, (first_byte(node), last_byte(node)))
+        kids[2].typ === nothing ||
+            push!(d, (first_byte(kids[2]), last_byte(kids[2])))
     end
-    kids = children(node)
     kids === nothing || for c in kids
         collect_unverified!(d, c, callsites, inmacro || k === K"macrocall")
     end

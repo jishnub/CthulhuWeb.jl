@@ -11,8 +11,8 @@ using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ans
                   headless_config, lookup_cached!, node_record, render_body,
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
-                  branch_resolved, conditional_arms, get_typed_sourcetext,
-                  is_dead_region,
+                  branch_resolved, collect_unverified!, conditional_arms,
+                  get_typed_sourcetext, is_dead_region,
                   has_call, has_typeable, names_in_source,
                   names_this_callsite, nothing_mapped,
                   source_tokens,
@@ -120,6 +120,16 @@ function literalreturn(v::Vector{Float64})
         return true
     end
     return false
+end
+
+# Destructuring: the one line lowers to an `indexed_iterate` per name plus a
+# `getfield` each, so several IR statements share it and the mapping hands the
+# `=` and the right-hand side whichever one it lands on. Measured: the `=` gets
+# a component's type and the call gets `indexed_iterate`'s `(element, state)`.
+_pairof(x::Float64) = (x + 1.0, x - 1.0)
+function destructured(x::Float64)
+    a, b = _pairof(x)
+    return a * b
 end
 
 # Two writes through `setindex!`, one of them compiled out. The source never
@@ -783,6 +793,41 @@ end
     tres = lookup_cached!(t, tnode, false)
     ttsn = first(get_typed_sourcetext(tnode.mi, tres.src, tres.rt))
     @test branch_resolved(only(nodes_of_kind(ttsn, K"?")))
+end
+
+@testset "a destructuring assignment is not typed by one of its parts" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    dmi = find_method_instance(provider, destructured, Tuple{Float64})
+    d = Session(provider, dmi; config=cfg)
+    dnode = d.nodes[ROOT_ID]
+    dres = lookup_cached!(d, dnode, false)
+    dtsn = first(get_typed_sourcetext(dnode.mi, dres.src, dres.rt))
+    asg = only(nodes_of_kind(dtsn, K"="))
+    rhs = children(asg)[2]
+
+    # what the mapping actually handed them: a component's type on the whole
+    # statement, and `indexed_iterate`'s `(element, state)` on the call
+    @test asg.typ === Float64
+    @test occursin("Int64", string(rhs.typ))
+    uv = collect_unverified!(Set{Tuple{Int,Int}}(), dtsn,
+                             Dict{Tuple{Int,Int},NamedTuple}(), false)
+    @test (first_byte(asg), last_byte(asg)) in uv
+    @test (first_byte(rhs), last_byte(rhs)) in uv
+
+    html = source_html(d, dnode, cfg)
+    @test html !== nothing
+    # the call keeps the type Cthulhu gave it, which overrides the mapping...
+    @test occursin("data-type=\"::Tuple{Float64, Float64}\"", html)
+    # ...the names keep their own...
+    @test occursin("data-type=\"::Float64\">a</span>", html)
+    @test occursin("data-type=\"::Float64\">b</span>", html)
+    # ...and the statement claims nothing, so hovering the comma or the `=` is
+    # silent rather than reporting one of the parts for the whole line.
+    @test occursin(
+        r"<span class=\"s-opaque\"><span class=\"s-opaque\"><span class=\"s s-stable\" data-type=\"::Float64\">a</span>",
+        html)
+    # the mismapped `(element, state)` never reaches the page
+    @test !occursin("Int64", html)
 end
 
 @testset "compiled-out code does not shadow a call's only source node" begin

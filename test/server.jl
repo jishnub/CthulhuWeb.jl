@@ -234,10 +234,7 @@ try
             @test haskey(SERVERS, chosen)
 
             # 8000 comes free, and the next run must stay put anyway
-            if blocker !== nothing
-                close(blocker); blocker = nothing
-                @test port_free(DEFAULT_PORT)
-            end
+            blocker === nothing || (close(blocker); blocker = nothing)
             descend_web(f3, Tuple{Float64})
             @test AUTO_PORT[] == chosen
             @test haskey(SERVERS, chosen)
@@ -247,9 +244,14 @@ try
             end
 
             # An explicit port is how trees run side by side, so it must not
-            # capture the automatic one.
-            @test pick_port(DEFAULT_PORT) == DEFAULT_PORT
-            @test AUTO_PORT[] == chosen
+            # capture the automatic one. Asked about a port nothing here uses,
+            # rather than about `DEFAULT_PORT`: probing that one twice in quick
+            # succession races with the OS releasing the bind we just closed.
+            scratch = 8796
+            if port_free(scratch)
+                @test pick_port(scratch) == scratch
+                @test AUTO_PORT[] == chosen
+            end
         finally
             blocker === nothing || close(blocker)
             chosen == 0 || stop_web(chosen)
