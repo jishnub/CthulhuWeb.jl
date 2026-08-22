@@ -952,6 +952,17 @@ end
         @test length(ws["nodes"]) == length(doc["nodes"])
     end
 
+    # A `for` header is two spans over one byte range -- the `iteration` node and
+    # the `in` inside it. They nest harmlessly in HTML; in the text they would be
+    # the same claim printed twice.
+    lmi = find_method_instance(provider, scaleall!, Tuple{Vector{Float64},Float64})
+    l = Session(provider, lmi; config=cfg)
+    expand!(l, ROOT_ID; optimize=false)
+    ltxt = session_text(session_document(l, ROOT_ID))
+    @test occursin("for i in eachindex(X)", ltxt)          # the source line
+    claims = count(ln -> occursin(r"\|     i in eachindex", ln), split(ltxt, '\n'))
+    @test claims == 1
+
     # A cap costs the far edges, never the part being read: the path to the open
     # node and its children go in ahead of the sweep the cap stops.
     small = session_document(x, bid; cap = 1)

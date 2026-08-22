@@ -258,7 +258,12 @@ function source_text(doc)
         nid === nothing || (what *= "   -> node " * string(nid) *
                                     " " * get(labels, Int(nid), ""))
         ln = line_of(text, offset, Int(_get(s, "first", offset)), firstline)
-        push!(get!(claims, ln, String[]), rpad(_oneline(_get(s, "text", "")), 48) * what)
+        # A `for` header is two spans over one byte range -- the `iteration` node
+        # and the `in` inside it -- which nest harmlessly in HTML and read as the
+        # same line printed twice here. Same claim, said once.
+        line = rpad(_oneline(_get(s, "text", "")), 48) * what
+        seen = get!(claims, ln, String[])
+        line in seen || push!(seen, line)
     end
 
     push!(lines, "")

@@ -530,12 +530,12 @@ async function exportSession(format) {
   if (format === "text") {
     try {
       await navigator.clipboard.writeText(res.payload);
-      hint.textContent = `copied ${res.payload.length} chars`;
+      hint.textContent = "copied";
       return;
     } catch (e) {
       // clipboard needs a secure context; localhost counts, but not every
       // browser agrees, so fall through to a download rather than lose the work
-      hint.textContent = "clipboard blocked — downloading instead";
+      hint.textContent = "clipboard blocked, saved";
     }
   }
   const blob = new Blob([res.payload],
@@ -547,7 +547,7 @@ async function exportSession(format) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-  if (format !== "text") hint.textContent = `saved ${res.filename}`;
+  if (format !== "text") hint.textContent = "saved";
 }
 
 function wire() {
