@@ -122,6 +122,25 @@ function literalreturn(v::Vector{Float64})
     return false
 end
 
+# `X[i] *= s` is a `setindex!` as much as `X[i] = v` is -- but Cthulhu's span
+# for the whole statement belongs to the `*`, since that is what the statement
+# evaluates to, so the write can never own a span here.
+function scaleall!(X::Vector{Float64}, s::Float64)
+    for i in eachindex(X)
+        X[i] *= s
+    end
+    return X
+end
+
+# ...and two writes in one statement, the shape of `LinearAlgebra.rcswap!`.
+# Which of them the statement is cannot be answered, so neither is placed.
+function swaprows!(X::Matrix{Float64}, i::Int, j::Int)
+    for k in axes(X, 2)
+        X[i,k], X[j,k] = X[j,k], X[i,k]
+    end
+    return X
+end
+
 # Destructuring: the one line lowers to an `indexed_iterate` per name plus a
 # `getfield` each, so several IR statements share it and the mapping hands the
 # `=` and the right-hand side whichever one it lands on. Measured: the `=` gets
@@ -261,6 +280,10 @@ function nodes_of_kind(node, k, acc = Any[])
     end
     return acc
 end
+
+"Just the rendered source, without the notes and the unlocated list around it."
+code_region(html::AbstractString) =
+    replace(html, r"^.*?<pre class=\"code src\">"s => "", r"</pre>.*$"s => "")
 
 "Plain text of each `.s-dead` region, in order -- what a reader sees faded."
 function dead_regions(html::AbstractString)
@@ -795,6 +818,44 @@ end
     @test branch_resolved(only(nodes_of_kind(ttsn, K"?")))
 end
 
+@testset "a call the source performs without naming is listed, not dropped" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+
+    # The unlocated list keys on the callee's name appearing in the source, and
+    # the source says `setindex!` nowhere -- so a write with no span to own was
+    # dropped from the pane entirely, though the tree holds it.
+    smi = find_method_instance(provider, scaleall!, Tuple{Vector{Float64},Float64})
+    sc = Session(provider, smi; config=cfg)
+    skids = expand!(sc, ROOT_ID; optimize=false)
+    sid = only(k for k in skids if sc.nodes[k].label.name == "setindex!")
+    gid = only(k for k in skids if sc.nodes[k].label.name == "getindex")
+    mid = only(k for k in skids if sc.nodes[k].label.name == "*")
+    shtml = source_html(sc, sc.nodes[ROOT_ID], cfg)
+    @test shtml !== nothing
+    scode = code_region(shtml)
+    # the statement evaluates to `X[i]*s`, so the `*` keeps the span...
+    @test occursin("data-node-id=\"$mid\"", scode)
+    @test occursin("data-node-id=\"$gid\"", scode)     # ...the read keeps its own...
+    @test !occursin("data-node-id=\"$sid\"", scode)    # ...and the write has none left
+    @test occursin(">setindex!(::Vector{Float64}, ::Float64, ::Int64)<", shtml)
+
+    # Two writes in one statement: neither can be placed, and both kinds still
+    # have to be reachable.
+    wmi = find_method_instance(provider, swaprows!, Tuple{Matrix{Float64},Int,Int})
+    w = Session(provider, wmi; config=cfg)
+    wkids = expand!(w, ROOT_ID; optimize=false)
+    idx = [k for k in wkids if w.nodes[k].label.name in ("getindex", "setindex!")]
+    @test length(idx) == 4
+    whtml = source_html(w, w.nodes[ROOT_ID], cfg)
+    @test whtml !== nothing
+    wcode = code_region(whtml)
+    for k in idx
+        @test !occursin("data-node-id=\"$k\"", wcode)
+    end
+    @test occursin(">setindex!(::Matrix{Float64}, ::Float64, ::Int64, ::Int64)<", whtml)
+    @test occursin(">getindex(::Matrix{Float64}, ::Int64, ::Int64)<", whtml)
+end
+
 @testset "a destructuring assignment is not typed by one of its parts" begin
     cfg = headless_config(CONFIG; view=:source, iswarn=true)
     dmi = find_method_instance(provider, destructured, Tuple{Float64})
@@ -880,9 +941,13 @@ end
     bhtml = source_html(b, b.nodes[bkids[bi]], cfg)
     @test bhtml !== nothing
     @test !occursin("s-dead", bhtml)
+    bcode = code_region(bhtml)
     for k in idx
-        @test !occursin("data-node-id=\"$k\"", bhtml)
+        @test !occursin("data-node-id=\"$k\"", bcode)
     end
+    # ...but the source does perform them, so they are listed rather than lost
+    @test occursin(">setindex!(::Matrix{Float64}, ::Float64, ::Int64, ::Int64)<", bhtml)
+    @test occursin(">getindex(::Matrix{Float64}, ::Int64, ::Int64)<", bhtml)
 end
 
 @testset "a body inference never annotated is explained, not greyed" begin

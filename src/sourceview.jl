@@ -636,7 +636,8 @@ assignment with no callsite at all.
 """
 function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, src,
                           sparams::Dict{String,Any}, unowned::Set{Tuple{Int,Int}},
-                          dead::Set{Tuple{Int,Int}} = Set{Tuple{Int,Int}}())
+                          dead::Set{Tuple{Int,Int}} = Set{Tuple{Int,Int}}(),
+                          recognised::Set{Int} = Set{Int}())
     isempty(unplaced) && return unplaced
     nodes = Any[]
     written = Set{Tuple{Int,Int}}()
@@ -654,16 +655,40 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
         # statement is the call -- its arguments are the target, the indices and
         # the right-hand side -- so the span covers it all, exactly as `f(x)`
         # covers its arguments.
+        #
+        # `X[I] *= s` counts as well. It is the same write, and it was the whole
+        # reason `rmul!(::AbstractArray, ::Number)` had a `setindex!` in the tree
+        # that appeared nowhere in the pane. Its children are (target, op, value)
+        # rather than (target, value), which only changes where the target sits.
+        #
+        # A DOTTED assignment does not: `A[i] .= v` is `dotview` and
+        # `materialize!`, not `setindex!`, so offering it here would only invent
+        # ties for the writes that are.
         kids = children(nd)
-        if k === K"=" && kids !== nothing && length(kids) == 2
+        isassign = (k === K"=" && kids !== nothing && length(kids) == 2) ||
+                   (k === K"op=" && kids !== nothing && length(kids) == 3)
+        if isassign && !is_dotted(JuliaSyntax.head(nd))
             lk = kind(kids[1])
             # `A[i] = v` reads nothing through `A[i]`: that span is the write.
-            # Recorded before descending, so the `ref` below sees it.
-            lk === K"ref" && push!(written, (first_byte(kids[1]), last_byte(kids[1])))
-            if unmapped(nd)
-                fn = lk === K"ref" ? setindex! : lk === K"." ? setproperty! : nothing
-                fn === nothing || push!(nodes, (fn, nd))
-            end
+            # Recorded before descending, so the `ref` below sees it. `A[i] *= v`
+            # is not recorded -- it really does read before it writes.
+            lk === K"ref" && k === K"=" &&
+                push!(written, (first_byte(kids[1]), last_byte(kids[1])))
+            # Offered whether or not the range is already taken. In
+            # `rmul!(::AbstractArray, ::Number)` the whole of `X[I] *= s` is
+            # Cthulhu's span for the `*`, so the `setindex!` can never own it --
+            # but the write is still written there, and saying so is what keeps
+            # it out of nowhere. Placement checks the range separately.
+            #
+            # A swap -- `X[k,i], X[k,j] = X[k,j], X[k,i]` in `rcswap!` -- is two
+            # writes in one statement. Offered once, so its two callsites tie and
+            # neither is placed: which of them the statement is cannot be
+            # answered. Offering it is still worth it for the same reason.
+            istuple = lk === K"tuple" && (tk = children(kids[1]);
+                                          tk !== nothing && any(c -> kind(c) === K"ref", tk))
+            fn = (lk === K"ref" || istuple) ? setindex! :
+                 lk === K"." ? setproperty! : nothing
+            fn === nothing || push!(nodes, (fn, nd))
         end
         # And so is a read through `[]`: `A[i,j]` is `getindex(A, i, j)`, whose
         # name the source says no more than it says `setindex!`. Unlike the
@@ -686,8 +711,14 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
     for k in unplaced
         n = s.nodes[k]
         hits = [nd for (v, nd) in nodes if matches(n, v, nd)]
-        length(hits) == 1 || (push!(left, k); continue)
-        target = hits[1]
+        # A form in the source matches this callee. Even where that is not enough
+        # to say WHICH one, it is enough to say the call is written here, which
+        # is what the unlocated list needs -- it otherwise keys on the callee's
+        # name, and the source says `getindex` and `setindex!` nowhere.
+        isempty(hits) || push!(recognised, k)
+        free = [nd for nd in hits if unmapped(nd)]
+        length(free) == 1 || (push!(left, k); continue)
+        target = free[1]
         claimants = count(unplaced) do j
             any(((v, nd),) -> nd === target && matches(s.nodes[j], v, nd), nodes)
         end
@@ -695,8 +726,9 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
         rng = (first_byte(target), last_byte(target))
         haskey(callsite_map, rng) && (push!(left, k); continue)
         # `a[i] = v` evaluates to `v`, not to what `setindex!` returns, so the
-        # statement gets the click but not the annotation.
-        kind(target) === K"=" && push!(unowned, rng)
+        # statement gets the click but not the annotation. Nor does `a[i] *= v`
+        # evaluate to it.
+        kind(target) in (K"=", K"op=") && push!(unowned, rng)
         l = n.label
         callsite_map[rng] = (id = k, rt = l.rt,
                              unstable = l.unstable, union = l.expected_union)
@@ -719,10 +751,11 @@ match alone.
 """
 function arity_matches(n::Node, nd)
     k = kind(nd)
-    (k === K"ref" || k === K"=") || return true
+    (k === K"ref" || k === K"=" || k === K"op=") || return true
     kids = children(nd)
     kids === nothing && return true
     target = k === K"ref" ? nd : kids[1]
+    kind(target) === K"tuple" && return true   # several writes, no single count
     tkids = children(target)
     tkids === nothing && return true
     any(c -> kind(c) === K"...", tkids) && return true
@@ -733,8 +766,10 @@ end
 """
 Does the source text name this callee anywhere?
 
-The test for whether an unlocated callsite is worth reporting. Cthulhu maps most
-callsites to a source range, but not all: in
+One of two tests for whether an unlocated callsite is worth reporting; the other
+is whether `place_by_callee!` recognised a form for it, which is how the calls
+the source performs without naming -- `getindex`, `setindex!`, `setproperty!` --
+get in. Cthulhu maps most callsites to a source range, but not all: in
 `generic_matmatmul_wrapper!` it locates `matmul2x2or3x3_nonzeroalpha!` and not
 `matmul_size_check`, both of which are written plainly in the body. Those are
 worth reporting; `literal_pow`, `setproperty!`, `convert`, `lastindex`, `pairs`
@@ -1107,10 +1142,11 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     # Body only: the method's own signature is a `call` node whose callee is the
     # method itself, and it would tie with a recursive call in the body.
     unowned = Set{Tuple{Int,Int}}()
+    recognised = Set{Int}()
     unplaced = try
         body === nothing ? unplaced :
             place_by_callee!(callsite_map, s, unplaced, body, tsn.source, sparams,
-                             unowned, deadspans)
+                             unowned, deadspans, recognised)
     catch
         unplaced
     end
@@ -1143,7 +1179,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     unlocated = unique_callsites(s,
         [k for k in unplaced
          if (s.nodes[k].descendable || s.nodes[k].expandable) &&
-            names_in_source(s.nodes[k], shown)])
+            (k in recognised || names_in_source(s.nodes[k], shown))])
     tail = unlocated_note(s, unlocated)
 
     sp = isempty(sparams) ? "" :
