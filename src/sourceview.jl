@@ -625,13 +625,23 @@ Required unique in both directions: one unmapped call node whose callee is this
 function, and one unmapped callsite for that node. `_modify2x2!` under
 `@stable_muladdmul` has two callsites for its one node, so it stays unplaced --
 the pairing has to be forced by the data, not picked.
+
+Compiled-out code is not a candidate. It cannot hold the callsite -- there is no
+callsite for code that did not run -- so it can only break the uniqueness that
+does the placing. `copytri!` writes `A[j,i] = ...` under `uplo == 'U'` and
+`A[i,j] = ...` under `elseif uplo == 'L'`; with `uplo` known the second is
+compiled out, but both looked like the one `setindex!`, so the tie left the live
+assignment with no callsite at all.
 """
 function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, src,
-                          sparams::Dict{String,Any}, unowned::Set{Tuple{Int,Int}})
+                          sparams::Dict{String,Any}, unowned::Set{Tuple{Int,Int}},
+                          dead::Set{Tuple{Int,Int}} = Set{Tuple{Int,Int}}())
     isempty(unplaced) && return unplaced
     nodes = Any[]
     unmapped(nd) = !haskey(callsite_map, (first_byte(nd), last_byte(nd)))
     function scan(nd)
+        # `dead` holds outermost regions, so this prunes the whole subtree
+        (first_byte(nd), last_byte(nd)) in dead && return
         k = kind(nd)
         if (k === K"call" || k === K"dotcall") && unmapped(nd)
             v = callee_value(nd, src, sparams)
@@ -1012,16 +1022,6 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
         end
     end
 
-    # Body only: the method's own signature is a `call` node whose callee is the
-    # method itself, and it would tie with a recursive call in the body.
-    unowned = Set{Tuple{Int,Int}}()
-    unplaced = try
-        body === nothing ? unplaced :
-            place_by_callee!(callsite_map, s, unplaced, body, tsn.source, sparams, unowned)
-    catch
-        unplaced
-    end
-
     # Dead-code marking applies to the body only. A signature default like
     # `kwshim(v; width = eltype(v) <: Complex ? 512 : 256)` is untyped in the
     # shim's own IR, which is an artefact of where the code lives, not evidence
@@ -1035,6 +1035,17 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     unmapped = !truncated && nothing_mapped(body) && body !== nothing && has_call(body)
     inlined = !truncated && !unmapped && result.optimized && body !== nothing
     truncated || unmapped || inlined || collect_dead!(deadspans, body)
+
+    # Body only: the method's own signature is a `call` node whose callee is the
+    # method itself, and it would tie with a recursive call in the body.
+    unowned = Set{Tuple{Int,Int}}()
+    unplaced = try
+        body === nothing ? unplaced :
+            place_by_callee!(callsite_map, s, unplaced, body, tsn.source, sparams,
+                             unowned, deadspans)
+    catch
+        unplaced
+    end
 
     src = tsn.source
     startb = first_byte(tsn)

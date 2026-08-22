@@ -122,6 +122,22 @@ function literalreturn(v::Vector{Float64})
     return false
 end
 
+# Two writes through `setindex!`, one of them compiled out. The source never
+# says `setindex!`, so the call can only be placed by matching the assignment --
+# and with both branches offered as candidates the match was not unique, which
+# left the live assignment with no callsite at all. This is `copytri!`, whose
+# `A[j,i] = ...` under `uplo == 'U'` is shadowed by the `A[i,j] = ...` under the
+# compiled-out `elseif uplo == 'L'`.
+Base.@constprop :aggressive function twowrite!(A::Matrix{Float64}, up::Bool)
+    if up
+        A[1,2] = float(length(A))
+    else
+        A[2,1] = float(length(A))
+    end
+    return A
+end
+twowritecaller(A::Matrix{Float64}) = twowrite!(A, true)
+
 # A ternary whose test folds away -- the shape of `copytri!`'s
 # `conjugate ? adjoint(A[i,j]) : transpose(A[i,j])`, where `conjugate` arrives as
 # `Core.Const(false)`. Both arms are calls of the same shape, which is what a
@@ -761,6 +777,34 @@ end
     tres = lookup_cached!(t, tnode, false)
     ttsn = first(get_typed_sourcetext(tnode.mi, tres.src, tres.rt))
     @test branch_resolved(only(nodes_of_kind(ttsn, K"?")))
+end
+
+@testset "compiled-out code does not shadow a call's only source node" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    wmi = find_method_instance(provider, twowritecaller, Tuple{Matrix{Float64}})
+    w = Session(provider, wmi; config=cfg)
+    wkids = expand!(w, ROOT_ID; optimize=false)
+    wi = findfirst(k -> w.nodes[k].label.name == "twowrite!", wkids)
+    @test wi !== nothing
+    wnode = w.nodes[wkids[wi]]
+    @test wnode.label.kind === :constprop
+    kids2 = expand!(w, wkids[wi]; optimize=false)
+    si = findfirst(k -> w.nodes[k].label.name == "setindex!", kids2)
+    @test si !== nothing
+    sid = kids2[si]
+
+    html = source_html(w, wnode, cfg)
+    @test html !== nothing
+    @test occursin("s-dead", html)                       # the else branch went
+    # ...and the surviving assignment is the setindex! callsite, clickable
+    @test occursin("data-node-id=\"$sid\"", html)
+    placed = span_content(html, sid)
+    @test occursin("1", replace(placed, r"<[^>]*>" => ""))
+    @test occursin("[", replace(placed, r"<[^>]*>" => ""))
+    @test !occursin("s-dead", placed)                    # not the dead write
+    # `a[i] = v` evaluates to `v`, not to what `setindex!` returns, so the span
+    # takes the click without claiming a type.
+    @test !occursin("data-type", split(placed, "<span")[1])
 end
 
 @testset "a body inference never annotated is explained, not greyed" begin
