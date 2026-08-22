@@ -222,8 +222,8 @@ and every `::` annotation in a signature are untyped without being dead -- and t
 regions that hold something typeable at all, since a literal carries no type
 whether it runs or not.
 """
-const DEAD_KINDS = (K"call", K"dotcall", K"block", K"if", K"elseif", K"||", K"&&",
-                    K".", K"return", K"for", K"while")
+const DEAD_KINDS = (K"call", K"dotcall", K"block", K"if", K"elseif", K"?", K"||",
+                    K"&&", K".", K"return", K"for", K"while")
 
 function is_dead_region(node)
     kind(node) in DEAD_KINDS || return false
@@ -309,18 +309,57 @@ places where one child being untyped says something about the others."
 const REGION_PARENTS = (K"block", K"||", K"&&")
 
 """
+Nodes whose children are the alternatives of one choice: exactly one runs, so an
+untyped one next to a typed one was compiled out.
+
+`?` belongs here as much as `if` does. Leaving it out is what left
+`conjugate ? adjoint(A[i,j]) : transpose(A[i,j])` in `copytri!` at full strength
+under `cos(ones(2,2))`, where `conjugate` is `Core.Const(false)`: `transpose(...)`
+was typed `::Float64` and `adjoint(...)` carried no type at all, and the reader
+was told nothing -- the call just silently refused to descend.
+"""
+const CHOICE_PARENTS = (K"if", K"elseif", K"?")
+
+"""
 The arms of a conditional: everything after the test.
 
 Only the arms say which way the branch went. The test does not: `eltype(v) ===
 Float64` mentions a typed `v` whether or not any arm ran, which is enough to make
 a naive sibling check believe the branch was resolved.
+
+`?` has the same shape -- `(? cond then else)` -- so the same drop applies.
 """
 conditional_arms(node) =
     (k = children(node); k === nothing ? () : Iterators.drop(k, 1))
 
-"Did any arm of this conditional run? `elseif` nests another conditional, so recurse."
-arm_taken(node) = kind(node) === K"elseif" ?
+"Did any arm of this conditional run? A nested conditional -- `elseif`, or the
+else-arm of a chained ternary -- has to be asked the same question rather than
+scanned for types, since its own test is typed either way."
+arm_taken(node) = kind(node) in (K"elseif", K"?") ?
     any(arm_taken, conditional_arms(node)) : has_typed_descendant(node)
+
+"""
+Was this branch decided before the code ran?
+
+Only then is "the other arm was compiled out" a thing that can be true, and the
+test is what says so: a test that produced a value is a test that ran. A folded
+test leaves no value behind -- `conjugate` in `copytri!` carries no type at all
+once it is `Core.Const(false)` -- or leaves a constant one.
+
+Without this, `det(::LU)` was a false positive. `isodd(c) ? -one(T) : one(T)` has
+`isodd(c)::Bool`, a real runtime test, and both arms run; but only `-one(T)` came
+back typed, because two identical `one(T)` calls on one line are ambiguous to
+`map_ssas_to_source` and an ambiguous mapping is dropped rather than guessed. A
+sibling check alone reads that dropped mapping as "unreachable" and greys out
+live code. Ternaries make this common in a way `if` blocks do not: both arms sit
+on one line and are usually near-identical expressions.
+"""
+function branch_resolved(node)
+    kids = children(node)
+    (kids === nothing || isempty(kids)) && return false
+    t = first(kids).typ
+    return t === nothing || t isa Core.Const
+end
 
 """
 Byte ranges of the regions that were compiled out.
@@ -341,8 +380,8 @@ function collect_dead!(d::Set{Tuple{Int,Int}}, node)
     kids = children(node)
     kids === nothing && return d
     k = kind(node)
-    live = if k === K"if" || k === K"elseif"
-        any(arm_taken, conditional_arms(node))
+    live = if k in CHOICE_PARENTS
+        branch_resolved(node) && any(arm_taken, conditional_arms(node))
     else
         k in REGION_PARENTS && any(has_typed_descendant, kids)
     end

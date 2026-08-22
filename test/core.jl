@@ -5,12 +5,14 @@ using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
                 find_method_instance
 using CthulhuWeb
 using LinearAlgebra: LinearAlgebra
-using JuliaSyntax: JuliaSyntax, @K_str, first_byte, last_byte
+using JuliaSyntax: JuliaSyntax, @K_str, children, first_byte, kind, last_byte
 # internals under test
 using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
+                  branch_resolved, conditional_arms, get_typed_sourcetext,
+                  is_dead_region,
                   has_call, has_typeable, names_in_source,
                   names_this_callsite, nothing_mapped,
                   source_tokens,
@@ -120,6 +122,20 @@ function literalreturn(v::Vector{Float64})
     return false
 end
 
+# A ternary whose test folds away -- the shape of `copytri!`'s
+# `conjugate ? adjoint(A[i,j]) : transpose(A[i,j])`, where `conjugate` arrives as
+# `Core.Const(false)`. Both arms are calls of the same shape, which is what a
+# ternary almost always looks like.
+Base.@constprop :aggressive ternbody(v, flag::Bool) = flag ? maximum(v) : minimum(v)
+terncaller(v) = ternbody(v, false)
+
+# ...and a ternary whose test RUNS. Both arms are live, but the two identical
+# `one(T)` calls on the line are ambiguous to `map_ssas_to_source`, so the else
+# arm comes back untyped next to a typed `-one(T)`. This is `det(::LU)`, and a
+# sibling check alone greys live code here.
+ternlive(n::Int, T) = isodd(n) ? -one(T) : one(T)
+ternlivecaller(n::Int) = ternlive(n, Float64)
+
 # ...but here the whole conditional folds to a constant, so NO arm carries types,
 # the arm that runs included. Nothing can be said about which way it went.
 function branchpick(v::Vector{Float64})
@@ -203,6 +219,16 @@ Base.@assume_effects :foldable function scbody(n::Int, x::Float64)
     return x + m
 end
 sccaller(x::Float64) = scbody(3, x)
+
+"Every node of a given kind in a typed syntax tree, outermost first."
+function nodes_of_kind(node, k, acc = Any[])
+    kind(node) === k && push!(acc, node)
+    kids = children(node)
+    kids === nothing || for c in kids
+        nodes_of_kind(c, k, acc)
+    end
+    return acc
+end
 
 "Plain text of each `.s-dead` region, in order -- what a reader sees faded."
 function dead_regions(html::AbstractString)
@@ -687,6 +713,54 @@ end
     lhtml = source_html(l, l.nodes[ROOT_ID], cfg)
     @test lhtml !== nothing
     @test !occursin("return true", join(dead_regions(lhtml), "\n"))
+end
+
+@testset "a ternary's untaken arm greys, but only once the test is known" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+
+    # `?` is a choice like `if` is, and was not treated as one: the untaken arm
+    # was left at full strength while refusing to descend, which says nothing to
+    # the reader about why.
+    tmi = find_method_instance(provider, terncaller, Tuple{Vector{Float64}})
+    t = Session(provider, tmi; config=cfg)
+    tkids = expand!(t, ROOT_ID; optimize=false)
+    ti = findfirst(k -> t.nodes[k].label.name == "ternbody", tkids)
+    @test ti !== nothing
+    tnode = t.nodes[tkids[ti]]
+    @test tnode.label.kind === :constprop
+    thtml = source_html(t, tnode, cfg)
+    @test thtml !== nothing
+    tfaded = join(dead_regions(thtml), "\n")
+    @test occursin("maximum(v)", replace(tfaded, r"<[^>]*>" => ""))
+    @test !occursin("minimum", tfaded)          # the arm that runs stays live
+    @test occursin("data-type=\"::Float64\"", thtml)
+
+    # A test that produced a value is a test that ran, so neither arm may be
+    # greyed -- however the mapping turned out. Without the check, the missing
+    # type on the else arm read as "unreachable" and greyed live code.
+    lmi2 = find_method_instance(provider, ternlivecaller, Tuple{Int})
+    l2 = Session(provider, lmi2; config=cfg)
+    l2kids = expand!(l2, ROOT_ID; optimize=false)
+    li = findfirst(k -> l2.nodes[k].label.name == "ternlive", l2kids)
+    @test li !== nothing
+    lnode = l2.nodes[l2kids[li]]
+    lres = lookup_cached!(l2, lnode, false)
+    ltsn = first(get_typed_sourcetext(lnode.mi, lres.src, lres.rt))
+    q = only(nodes_of_kind(ltsn, K"?"))
+    arms = collect(conditional_arms(q))
+    @test !branch_resolved(q)                   # `isodd(n)::Bool` ran
+    @test first(children(q)).typ === Bool
+    @test arms[1].typ !== nothing               # ...and the sibling check alone
+    @test arms[2].typ === nothing               #    would have fired on this
+    @test is_dead_region(arms[2])
+    lhtml2 = source_html(l2, lnode, cfg)
+    @test lhtml2 !== nothing
+    @test !occursin("s-dead", lhtml2)
+
+    # A folded test leaves either no value at all or a constant one.
+    tres = lookup_cached!(t, tnode, false)
+    ttsn = first(get_typed_sourcetext(tnode.mi, tres.src, tres.rt))
+    @test branch_resolved(only(nodes_of_kind(ttsn, K"?")))
 end
 
 @testset "a body inference never annotated is explained, not greyed" begin
