@@ -3,7 +3,8 @@
 using Test
 using HTTP, JSON3
 using CthulhuWeb
-using CthulhuWeb: ESC, SERVERS
+using CthulhuWeb: AUTO_PORT, DEFAULT_PORT, ESC, SERVERS, pick_port, port_free
+using Sockets: Sockets
 
 wsdemo() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
 usermacro(x) = (T = x > 0 ? Int64 : Float64; sqrt(abs(rand(T))))
@@ -211,6 +212,49 @@ try
             stop_web(8794)
         end
         @test !haskey(SERVERS, 8794)
+    end
+
+    @testset "an automatic port is kept, so the tab is what gets replaced" begin
+        # The point of reusing a port is that a browser tab is pointed at it.
+        # Scanning up from `DEFAULT_PORT` every time does not do that: land on
+        # 8001 once because something held 8000 for a moment, and the next run
+        # drifts back to 8000 -- serving the new session where nobody is
+        # looking and leaving the old one up on 8001 under the tab that is.
+        # Observed in a REPL: two live servers, and the tab showing the
+        # previous call's tree.
+        f3(x) = abs(x) + 1
+        saved = AUTO_PORT[]
+        blocker = try Sockets.listen(Sockets.localhost, DEFAULT_PORT) catch; nothing end
+        AUTO_PORT[] = nothing
+        chosen = 0
+        try
+            descend_web(f3, Tuple{Float64})
+            chosen = AUTO_PORT[]
+            @test chosen > DEFAULT_PORT            # scanned past whatever holds 8000
+            @test haskey(SERVERS, chosen)
+
+            # 8000 comes free, and the next run must stay put anyway
+            if blocker !== nothing
+                close(blocker); blocker = nothing
+                @test port_free(DEFAULT_PORT)
+            end
+            descend_web(f3, Tuple{Float64})
+            @test AUTO_PORT[] == chosen
+            @test haskey(SERVERS, chosen)
+            @test !haskey(SERVERS, DEFAULT_PORT)   # not a second server
+            HTTP.WebSockets.open("ws://localhost:$chosen/") do ws
+                @test occursin("f3", JSON3.read(first(ws)).root.name)
+            end
+
+            # An explicit port is how trees run side by side, so it must not
+            # capture the automatic one.
+            @test pick_port(DEFAULT_PORT) == DEFAULT_PORT
+            @test AUTO_PORT[] == chosen
+        finally
+            blocker === nothing || close(blocker)
+            chosen == 0 || stop_web(chosen)
+            AUTO_PORT[] = saved
+        end
     end
 
     @testset "serves before analysing" begin

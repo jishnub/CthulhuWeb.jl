@@ -178,6 +178,15 @@ const SERVERS = Dict{Int,Any}()
 const DEFAULT_PORT = 8000
 const PORT_SCAN = 50
 
+"""The port the last `descend_web` with no explicit `port` settled on.
+
+Which port that is only matters because a browser tab is pointed at it. Scanning
+from `DEFAULT_PORT` every time is not the same thing: land on 8001 once because
+something held 8000 for a moment, and the next run drifts back down to 8000,
+serving the new session where nobody is looking and leaving the old one up on
+8001 under the tab that is."""
+const AUTO_PORT = Ref{Union{Nothing,Int}}(nothing)
+
 "Is `port` bindable right now? Racy by nature, but enough to give a good error
 instead of a TaskFailedException out of HTTP's listener task."
 function port_free(port::Int)
@@ -192,11 +201,14 @@ end
 """
 Resolve the port to serve on.
 
-- `nothing` (the default): reuse `DEFAULT_PORT` if we already own it — so
-  successive runs replace in place and the browser tab keeps working — otherwise
-  the first free port at or after it.
+- `nothing` (the default): the port this session last served on with no explicit
+  `port`, if it is still ours or still free — so successive runs replace in place
+  and the browser tab keeps working. Failing that, `DEFAULT_PORT` or the first
+  free port after it.
 - an explicit port: that port or nothing. Silently moving would be worse than
-  failing when the caller named one.
+  failing when the caller named one. Explicit ports are how several trees run
+  side by side, so they are deliberately not remembered as the one to come back
+  to.
 """
 function pick_port(requested::Union{Nothing,Int})
     if requested !== nothing
@@ -204,8 +216,13 @@ function pick_port(requested::Union{Nothing,Int})
         error("port $requested is already in use by another process. " *
               "Pass a different `port`, or omit `port` to pick a free one automatically.")
     end
+    # Ours OR free: still ours is the re-run case, free is the case where
+    # `stop_web()` came in between and a tab is sitting there reconnecting.
+    last = AUTO_PORT[]
+    last === nothing || haskey(SERVERS, last) || port_free(last) || (last = nothing)
+    last === nothing || return last
     for p in DEFAULT_PORT:(DEFAULT_PORT + PORT_SCAN)
-        (haskey(SERVERS, p) || port_free(p)) && return p
+        (haskey(SERVERS, p) || port_free(p)) && return (AUTO_PORT[] = p)
     end
     error("no free port found in $DEFAULT_PORT:$(DEFAULT_PORT + PORT_SCAN); pass `port` explicitly.")
 end
@@ -259,9 +276,9 @@ end
 
 Serve Cthulhu's call tree as a clickable nested list at http://localhost:port.
 
-With no `port`, serves on $DEFAULT_PORT, reusing it if this session already owns
-it — so re-running replaces the previous server in place and an open browser tab
-keeps working — or the next free port if something else holds it. Pass `port`
+With no `port`, serves on $DEFAULT_PORT, or the next free port if something else
+holds it — and then stays on whichever it picked, so re-running replaces the
+previous server in place and an open browser tab keeps working. Pass `port`
 explicitly to demand a specific one, or to run several side by side.
 
 Other keyword arguments are the usual `Cthulhu.CONFIG` options (`view`,
