@@ -62,6 +62,37 @@ a call to descend into it. A breadcrumb trail, an **↑ caller** button and
 **Toolbar.** *Data* options (`optimize`, `debuginfo`) refetch from Julia; display
 options (`warn`, `effects`, `syntax`, …) apply instantly in the browser.
 
+## Handing a session over
+
+To ask someone — or something — about what you are looking at without
+describing it, *Export* it. **Download JSON** saves the session; **Copy for an
+LLM** puts the same document on the clipboard as text.
+
+Either carries the tree as you explored it, which rows you have open, and the
+source of the node you are reading — with every claim the pane makes about it:
+the type reported for each span, the callsite it descends into, and the regions
+greyed as compiled out. A screenshot shows what a span looks like; this says
+what it says.
+
+```julia
+julia> ws = load_session("cthulhuweb-tanh_Matrix_Float64.json")
+WebSession(MethodInstance for tanh(::Matrix{Float64}), 147 nodes)
+
+julia> ws                                  # showing it prints the readable form
+# Cthulhu web session
+entry    MethodInstance for tanh(::Matrix{Float64})
+...
+605 |             A[j,i] = conjugate ? adjoint(A[i,j]) : transpose(A[i,j])
+    |     adjoint(A[i,j])           <<compiled out>>
+    |     transpose(A[i,j])         ::Float64   -> node 47 transpose(::Float64) ::Float64
+
+julia> ws["source"]["spans"]               # or query the document directly
+```
+
+`export_web("session.json")` writes the same thing from the REPL, without the
+browser — though only the browser knows which rows are open on screen. A `.txt`
+or `.md` path gets the text rendering instead.
+
 ## Notes
 
 - Inference runs on a single worker, so a second `@descend_web` issued while a

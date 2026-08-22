@@ -3,7 +3,8 @@
 using Test
 using HTTP, JSON3
 using CthulhuWeb
-using CthulhuWeb: AUTO_PORT, DEFAULT_PORT, ESC, SERVERS, pick_port, port_free
+using CthulhuWeb: AUTO_PORT, DEFAULT_PORT, ESC, SERVERS, SESSIONS, pick_port,
+                  port_free, session_text
 using Sockets: Sockets
 
 wsdemo() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
@@ -212,6 +213,54 @@ try
             stop_web(8794)
         end
         @test !haskey(SERVERS, 8794)
+    end
+
+    @testset "a session can be handed over whole" begin
+        # The point is to skip describing what is on screen: the export has to
+        # carry the tree, the open node's source, and what the pane claims about
+        # it -- in a form Julia loads back and in one to paste elsewhere.
+        f4(x) = sqrt(abs(x)) + length(string(x))
+        descend_web(f4, Tuple{Float64}; port=8797, view=:source, iswarn=true)
+        try
+            sleep(0.5)
+            HTTP.WebSockets.open("ws://localhost:8797/") do ws
+                first(ws)
+                kids = rpc(ws, "expand"; id=1)
+                @test !isempty(kids.nodes)
+
+                j = rpc(ws, "export"; id=1, expanded=[1], format="json")
+                @test j.op == "export"
+                @test endswith(j.filename, ".json")
+                doc = JSON3.read(j.payload)
+                @test doc.cthulhuweb == CthulhuWeb.EXPORT_VERSION
+                @test doc.open == 1
+                @test doc.expanded == [1]          # only the browser knows this
+                @test length(doc.nodes) >= length(kids.nodes)
+                @test doc.source.available
+                @test !isempty(doc.source.spans)
+                @test any(sp -> sp.type !== nothing, doc.source.spans)
+
+                t = rpc(ws, "export"; id=1, expanded=[1], format="text")
+                @test endswith(t.filename, ".txt")
+                @test occursin("# Cthulhu web session", t.payload)
+                @test occursin("<-- open", t.payload)
+                # the two formats are one document, so they must agree
+                @test t.payload == session_text(doc)
+            end
+
+            # ...and without a browser at all
+            path = joinpath(mktempdir(), "session.json")
+            @test export_web(path; port=8797) == path
+            ws2 = load_session(path)
+            @test ws2["open"] == 1
+            @test occursin("# Cthulhu web session", session_text(ws2))
+            tpath = joinpath(mktempdir(), "session.txt")
+            export_web(tpath; port=8797)
+            @test occursin("## Call tree", read(tpath, String))
+        finally
+            stop_web(8797)
+        end
+        @test !haskey(SESSIONS, 8797)
     end
 
     @testset "an automatic port is kept, so the tab is what gets replaced" begin

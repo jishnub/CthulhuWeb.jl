@@ -971,7 +971,15 @@ struct RenderCtx
     classmap::Vector{UInt8}
     offset::Int
     idxend::Int
+    # Where `open_span` records what it decided, for an export to serialise the
+    # same claims the page makes. A second walk would drift from this one; the
+    # sink cannot, because it IS this one. `nothing` when nobody is collecting.
+    spans::Union{Nothing,Vector{NamedTuple}}
 end
+
+RenderCtx(src, callsites, dead, unverified, unowned, sparams, classmap, offset, idxend) =
+    RenderCtx(src, callsites, dead, unverified, unowned, sparams, classmap, offset,
+              idxend, nothing)
 
 """
 Spans one source range shares with several IR statements, so the type the
@@ -1066,13 +1074,18 @@ inlined_note(node::Node) =
     "return type <code>" * html_escape(node.label.rt) * "</code> still hold.</p>"
 
 """
-    source_html(session, node, cfg) -> String
+    source_html(session, node, cfg; report = nothing) -> String
 
 Render the node's source with nested `<span>`s carrying inferred types, and
 `data-node-id` on the spans that correspond to descendable callsites.
 Falls back to the ANSI pipeline when no typed source is available.
+
+With a `report` dictionary, also fill it in with what the page claims -- the
+spans, the note, the unlocated list, the file and the source text -- so an
+export carries the same facts rather than a second opinion. See `record_span!`.
 """
-function source_html(s::Session, node::Node, cfg::CthulhuConfig)
+function source_html(s::Session, node::Node, cfg::CthulhuConfig;
+                     report::Union{Nothing,Dict{String,Any}} = nothing)
     node.ci === nothing && return nothing
     result = lookup_cached!(s, node, false)   # :source implies optimize=false
     result === nothing && return nothing
@@ -1203,7 +1216,8 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
     inlined && distrust_body!(unverified, body, callsite_map)
     ctx = RenderCtx(src, callsite_map, deadspans, unverified,
                     collect_unowned!(unowned, tsn),
-                    sparams, token_classmap(src, startb, idxend), startb, idxend)
+                    sparams, token_classmap(src, startb, idxend), startb, idxend,
+                    report === nothing ? nothing : NamedTuple[])
     io = IOBuffer()
     walk_source(io, tsn, startb, ctx)
     code = String(take!(io))
@@ -1236,6 +1250,21 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
         join(["<b>" * html_escape(k) * "</b> = " * html_escape(string(v))
               for (k, v) in sort!(collect(sparams), by=first)], ", ") * "</div>"
 
+    if report !== nothing
+        report["file"]      = node.label.file
+        report["firstline"] = firstline
+        report["text"]      = String(src[startb:min(idxend, lastindex(src))])
+        report["offset"]    = startb
+        report["spans"]     = ctx.spans
+        report["sparams"]   = Dict{String,Any}(k => string(v) for (k, v) in sparams)
+        report["note"]      = strip(replace(note, r"<[^>]*>" => ""))
+        report["truncated"] = truncated
+        report["unmapped"]  = unmapped
+        report["inlined"]   = inlined
+        report["unlocated"] = [Dict{String,Any}("node" => k,
+                                                "label" => body_label(s.nodes[k]))
+                               for k in unlocated]
+    end
     return file * sp * note *
         "<div class=\"srcwrap\"><pre class=\"gutter\">" * gutter * "</pre>" *
         "<pre class=\"code src\">" * code * "</pre></div>" * tail
@@ -1321,6 +1350,24 @@ uninteresting_const(@nospecialize(typ), iscallee::Bool) =
     iscallee && typ isa Core.Const &&
     (typ.val isa Function || typ.val isa Type || typ.val isa Module)
 
+"""
+Note one span the page is about to emit, for an export to carry.
+
+Byte range, the type claimed for it (`nothing` where the page deliberately
+claims none), the callsite it descends into, and the classes -- which is where
+`s-dead`, `s-opaque` and the stability colour live. Everything the reader can
+see, in the form the reader sees it.
+"""
+function record_span!(ctx::RenderCtx, fb::Int, lb::Int, @nospecialize(typ),
+                      nodeid::Int, classes::Vector{String}, issparam::Bool)
+    ctx.spans === nothing && return nothing
+    push!(ctx.spans, (first = fb, last = lb,
+                      text = String(ctx.src[fb:min(lb, lastindex(ctx.src))]),
+                      type = typ === nothing ? nothing : string(typ),
+                      sparam = issparam, node = nodeid, classes = copy(classes)))
+    return nothing
+end
+
 function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Bool)
     src, sparams = ctx.src, ctx.sparams
     typ = node.typ
@@ -1349,6 +1396,7 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
     if (fb, lb) in ctx.dead
         # Grey the whole subtree, and say why on hover -- an unexplained grey
         # block reads as a rendering failure.
+        record_span!(ctx, fb, lb, nothing, 0, ["s", "s-dead"], false)
         print(io, "<span class=\"s s-dead\" data-type=\"",
               "unreachable: compiled out for these argument types\">")
         return true
@@ -1368,6 +1416,7 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
         # A dotted callee (`LAPACK.gesdd!`) is composite but not untyped -- see
         # `suppressed` above -- so it falls through here as well.
         (is_leaf(node) || suppressed) && return false
+        record_span!(ctx, fb, lb, nothing, 0, ["s-opaque"], false)
         print(io, "<span class=\"s-opaque\">")
         return true
     end
@@ -1398,6 +1447,7 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
     runtime && push!(classes, "s-runtime")
     nodeid != 0 && push!(classes, "s-call")
 
+    record_span!(ctx, fb, lb, typ, nodeid, classes, issparam)
     print(io, "<span class=\"", join(classes, ' '), "\"")
     if typ !== nothing
         label = issparam ? "$(String(src[fb:lb])) = $(typ)   (static parameter)" :

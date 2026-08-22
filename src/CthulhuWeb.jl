@@ -40,13 +40,14 @@ using HTTP
 using JSON3
 using Sockets
 
-export descend_web, @descend_web, stop_web, web_status
+export descend_web, @descend_web, stop_web, web_status, export_web, load_session
 
 const ASSETS = joinpath(@__DIR__, "assets")
 
 include("session.jl")
 include("render.jl")
 include("sourceview.jl")
+include("export.jl")
 include("server.jl")
 
 function __init__()

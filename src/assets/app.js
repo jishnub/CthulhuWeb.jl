@@ -508,6 +508,48 @@ function applyDisplayFlags() {
   b.classList.toggle("no-syntax", !$("#syntax").checked);
 }
 
+// The server knows the tree and the source; only the browser knows which rows
+// are open and which one is being read, so both go up with the request. JSON
+// downloads (`load_session` reads it back), text goes to the clipboard, which is
+// the whole point of the second button -- one click to paste it somewhere.
+async function exportSession(format) {
+  const hint = $("#exportHint");
+  hint.textContent = "collecting…";
+  const res = await send("export", {
+    id: selected === null ? 1 : selected,
+    expanded: [...expanded],
+    format,
+  });
+  // `send` reports a dead socket as `error`; the server reports its own trouble
+  // as an `error` op. Neither carries a payload, and a Blob of "undefined" is a
+  // worse answer than saying so.
+  if (res.error || res.op === "error" || typeof res.payload !== "string") {
+    hint.textContent = res.error || res.msg || "export failed";
+    return;
+  }
+  if (format === "text") {
+    try {
+      await navigator.clipboard.writeText(res.payload);
+      hint.textContent = `copied ${res.payload.length} chars`;
+      return;
+    } catch (e) {
+      // clipboard needs a secure context; localhost counts, but not every
+      // browser agrees, so fall through to a download rather than lose the work
+      hint.textContent = "clipboard blocked — downloading instead";
+    }
+  }
+  const blob = new Blob([res.payload],
+                        { type: format === "text" ? "text/plain" : "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = res.filename || (format === "text" ? "session.txt" : "session.json");
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  if (format !== "text") hint.textContent = `saved ${res.filename}`;
+}
+
 function wire() {
   for (const el of document.querySelectorAll("input[name=view]")) {
     el.onchange = () => setServerConfig("view", el.value);
@@ -518,6 +560,8 @@ function wire() {
     $("#" + id).onchange = applyDisplayFlags;
   }
   applyDisplayFlags();
+  $("#exportJson").onclick = () => exportSession("json");
+  $("#exportText").onclick = () => exportSession("text");
 
   // Backspace ascends, matching Cthulhu's terminal UI (backspace / the ↩ entry).
   document.addEventListener("keydown", (e) => {

@@ -125,6 +125,32 @@ op_body(s::Session, id::NodeId) = Dict{String,Any}(
     "html" => render_body(s, s.nodes[id], s.config),
 )
 
+"""
+Hand the whole session over: the tree as explored, and the open node's source
+with the claims the pane makes about it.
+
+Two formats over one document. JSON loads back with `load_session`; the text is
+the same document rendered to read, for pasting somewhere that cannot run Julia.
+`expanded` is the browser's open/closed state, which the server does not
+otherwise know.
+"""
+function op_export(s::Session, id::NodeId, expanded::Vector{NodeId}, fmt::String)
+    doc = session_document(s, id; expanded = expanded)
+    return Dict{String,Any}(
+        "op"       => "export",
+        "format"   => fmt,
+        "filename" => export_filename(s, fmt),
+        "payload"  => fmt == "text" ? session_text(doc) : JSON3.write(doc),
+    )
+end
+
+"A filename that says which call it came from, safe on any filesystem."
+function export_filename(s::Session, fmt::String)
+    name = replace(s.nodes[ROOT_ID].label.name, r"^MethodInstance for " => "")
+    name = replace(name, r"[^A-Za-z0-9_.-]+" => "_")
+    return "cthulhuweb-" * first(strip(name, '_'), 60) * (fmt == "text" ? ".txt" : ".json")
+end
+
 function op_config(s::Session, key::String, value)
     sym = Symbol(key)
     val = value
@@ -149,6 +175,12 @@ function handle(s::Session, msg)
     op == "expand" && return op_tree(s, Int(msg[:id]))
     op == "body"   && return op_body(s, Int(msg[:id]))
     op == "config" && return op_config(s, String(msg[:key]), msg[:value])
+    if op == "export"
+        exp = get(msg, :expanded, nothing)
+        return op_export(s, Int(get(msg, :id, ROOT_ID)),
+                         exp === nothing ? NodeId[] : NodeId[Int(x) for x in exp],
+                         String(get(msg, :format, "json")))
+    end
     return Dict{String,Any}("op" => "error", "msg" => "unknown op: $op")
 end
 
@@ -174,6 +206,10 @@ end
 """Servers started by `descend_web`, keyed by port, so re-running on the same
 port in a REPL replaces the old one instead of failing to bind."""
 const SERVERS = Dict{Int,Any}()
+
+"""The task building each server's `Session`, kept so `export_web` can reach the
+session a browser is looking at without going through the browser."""
+const SESSIONS = Dict{Int,Task}()
 
 const DEFAULT_PORT = 8000
 const PORT_SCAN = 50
@@ -233,6 +269,7 @@ end
 """
 function stop_web(port::Union{Nothing,Int} = nothing)
     for p in (port === nothing ? collect(keys(SERVERS)) : [port])
+        pop!(SESSIONS, p, nothing)
         srv = pop!(SERVERS, p, nothing)
         srv === nothing && continue
         try shutdown_server(srv) catch end
@@ -257,6 +294,46 @@ not been created yet, which is the error they saw.
 """
 shutdown_server(srv) =
     isdefined(HTTP, :forceclose) ? HTTP.forceclose(srv) : close(srv)
+
+"""
+    export_web([path]; port = nothing, id = ROOT_ID, text = false)
+
+Write the running session to `path` without going through the browser: the tree
+as explored, and `id`'s source with every claim the pane makes about it. Read it
+back with [`load_session`](@ref), or hand the `.txt` form to something that
+cannot run Julia.
+
+With no `port`, the only running server; pass one when several are up. The
+browser has its own buttons for this, which additionally record which rows are
+open on screen -- something only the browser knows.
+"""
+function export_web(path::Union{Nothing,AbstractString} = nothing;
+                    port::Union{Nothing,Int} = nothing, id::Int = ROOT_ID,
+                    text::Bool = path !== nothing &&
+                                 (endswith(path, ".txt") || endswith(path, ".md")))
+    isempty(SESSIONS) && error("no Cthulhu web session is running; start one with descend_web")
+    if port === nothing
+        length(SESSIONS) == 1 ||
+            error("several sessions are running (" *
+                  join(sort(collect(keys(SESSIONS))), ", ") * "); pass `port`")
+        port = first(keys(SESSIONS))
+    end
+    haskey(SESSIONS, port) || error("no session on port $port")
+    p = port
+    session = fetch(SESSIONS[p])::Session
+    # On the worker like every other analysis: rendering a body can still infer.
+    out = on_worker() do
+        doc = session_document(session, id)
+        text ? session_text(doc) : JSON3.write(doc)
+    end
+    out isa AbstractString || error("could not build the export: $out")
+    dest = path === nothing ? export_filename(session, text ? "text" : "json") : String(path)
+    open(dest, "w") do io
+        write(io, out)
+    end
+    @info "Wrote $(length(out)) bytes to $dest"
+    return dest
+end
 
 """
     @descend_web f(args...)
@@ -342,6 +419,7 @@ function descend_web(@nospecialize(args...); port::Union{Nothing,Int} = nothing,
               first(sprint(showerror, err), 200))
     end
     SERVERS[port] = server
+    SESSIONS[port] = session_task
 
     url = "http://localhost:$port"
     @info "Cthulhu web UI at $url  —  $(mi)  (stop_web() to shut down)"

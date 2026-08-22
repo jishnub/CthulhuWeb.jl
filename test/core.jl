@@ -6,11 +6,13 @@ using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
 using CthulhuWeb
 using LinearAlgebra: LinearAlgebra
 using JuliaSyntax: JuliaSyntax, @K_str, children, first_byte, kind, last_byte
+using JSON3: JSON3
 # internals under test
 using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
+                  EXPORT_VERSION, session_document, session_text, load_session,
                   branch_resolved, collect_unverified!, conditional_arms,
                   get_typed_sourcetext, is_dead_region,
                   has_call, has_typeable, names_in_source,
@@ -895,6 +897,69 @@ end
     zhtml = source_html(z, z.nodes[ROOT_ID], cfg)
     @test zhtml !== nothing
     @test !occursin("getproperty(::Module", zhtml)
+end
+
+@testset "an exported session carries the claims, not just the look" begin
+    cfg = headless_config(CONFIG; view=:source, iswarn=true)
+    xmi = find_method_instance(provider, twowritecaller, Tuple{Matrix{Float64}})
+    x = Session(provider, xmi; config=cfg)
+    xkids = expand!(x, ROOT_ID; optimize=false)
+    bi = findfirst(k -> x.nodes[k].label.name == "twowrite!", xkids)
+    @test bi !== nothing
+    bid = xkids[bi]
+    bodykids = expand!(x, bid; optimize=false)
+    doc = session_document(x, bid)
+
+    @test doc["cthulhuweb"] == EXPORT_VERSION
+    @test doc["open"] == bid
+    @test doc["path"] == [ROOT_ID, bid]
+    ids = [n["id"] for n in doc["nodes"]]
+    @test ROOT_ID in ids && bid in ids
+    @test all(k -> k in ids, bodykids)            # the open node's children survive a cap
+    @test doc["explored"] == length(x.nodes)
+    @test doc["truncated"] == 0
+
+    src = doc["source"]
+    @test src["available"]
+    spans = src["spans"]
+    # A screenshot shows what a span looks like; this has to say what it claims.
+    @test any(sp -> "s-dead" in sp["classes"], spans)          # the folded branch
+    @test any(sp -> sp["type"] == "Float64", spans)
+    sid = only(k for k in bodykids if x.nodes[k].label.name == "setindex!")
+    @test any(sp -> sp["node"] == sid, spans)
+
+    # ...and they are the page's own claims: the export shares its walk, so every
+    # click target it names is one the page emits.
+    html = source_html(x, x.nodes[bid], cfg)
+    for sp in spans
+        sp["node"] === nothing && continue
+        @test occursin("data-node-id=\"$(sp["node"])\"", html)
+    end
+
+    txt = session_text(doc)
+    @test occursin("# Cthulhu web session", txt)
+    @test occursin("<-- open", txt)
+    @test occursin("<<compiled out>>", txt)
+    @test occursin("setindex!", txt)
+    @test occursin("A[1,2] = 2 * A[2,1]", txt)   # the body itself, line by line
+
+    # A file written today has to read the same when it is loaded back.
+    mktemp() do path, io
+        write(io, JSON3.write(doc)); close(io)
+        ws = load_session(path)
+        @test session_text(ws) == txt
+        @test ws["open"] == bid
+        @test length(ws["nodes"]) == length(doc["nodes"])
+    end
+
+    # A cap costs the far edges, never the part being read: the path to the open
+    # node and its children go in ahead of the sweep the cap stops.
+    small = session_document(x, bid; cap = 1)
+    sids = [n["id"] for n in small["nodes"]]
+    @test ROOT_ID in sids
+    @test bid in sids
+    @test all(k -> k in sids, bodykids)
+    @test small["truncated"] == small["explored"] - length(sids)
 end
 
 @testset "a destructuring assignment is not typed by one of its parts" begin
