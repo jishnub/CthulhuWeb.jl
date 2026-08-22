@@ -684,11 +684,17 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
             # writes in one statement. Offered once, so its two callsites tie and
             # neither is placed: which of them the statement is cannot be
             # answered. Offering it is still worth it for the same reason.
-            istuple = lk === K"tuple" && (tk = children(kids[1]);
-                                          tk !== nothing && any(c -> kind(c) === K"ref", tk))
+            tk = lk === K"tuple" ? children(kids[1]) : nothing
+            istuple = tk !== nothing && any(c -> kind(c) === K"ref", tk)
             fn = (lk === K"ref" || istuple) ? setindex! :
                  lk === K"." ? setproperty! : nothing
             fn === nothing || push!(nodes, (fn, nd))
+            # Destructuring reads through `indexed_iterate`, once per name:
+            # `X′, Y′ = _subadd!!(X, Y)` in `tanh(::AbstractMatrix)` holds two of
+            # them and writes neither. With more than one name they tie and
+            # nothing is placed, which is right -- the statement is not any one
+            # of them -- but the tie is what gets them listed.
+            tk === nothing || push!(nodes, (Base.indexed_iterate, nd))
         end
         # And so is a read through `[]`: `A[i,j]` is `getindex(A, i, j)`, whose
         # name the source says no more than it says `setindex!`. Unlike the
@@ -1090,6 +1096,16 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig)
                                                             tsn.source, sparams)
                     append!(unplaced, ks)
                     continue
+                end
+                # Losing a span contest is not the same as not being called.
+                # `f(x; kw=1)` lowers to a NamedTuple construction as well as the
+                # call, and `X′, Y′ = _subadd!!(X, Y)` puts two
+                # `indexed_iterate`s on the range the call wins. Dropping the
+                # losers here made the pane silently omit calls the tree holds --
+                # the one thing the unlocated note exists to prevent. They go
+                # where every other unplaced callsite goes and are judged there.
+                for j in ks
+                    j == k || push!(unplaced, j)
                 end
                 l = s.nodes[k].label
                 # Carry Cthulhu's own return type for the callsite, not just the

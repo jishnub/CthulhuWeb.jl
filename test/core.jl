@@ -887,8 +887,21 @@ end
     @test occursin(
         r"<span class=\"s-opaque\"><span class=\"s-opaque\"><span class=\"s s-stable\" data-type=\"::Float64\">a</span>",
         html)
-    # the mismapped `(element, state)` never reaches the page
-    @test !occursin("Int64", html)
+    # the mismapped `(element, state)` never reaches the code
+    @test !occursin("Int64", code_region(html))
+
+    # The reads the destructuring performs are the calls the source does not
+    # name. They lose the statement's span to `_pairof`, which does not mean
+    # they are not called -- they must still be reachable.
+    ii = [k for k in expand!(d, ROOT_ID; optimize=false)
+          if occursin("indexed_iterate", String(d.nodes[k].label.name))]
+    @test length(ii) == 2
+    dcode = code_region(html)
+    for k in ii
+        @test !occursin("data-node-id=\"$k\"", dcode)
+    end
+    @test occursin(">Base.indexed_iterate(::Tuple{Float64, Float64}, ::Int64)<", html)
+    @test occursin(">Base.indexed_iterate(::Tuple{Float64, Float64}, ::Int64, ::Int64)<", html)
 end
 
 @testset "compiled-out code does not shadow a call's only source node" begin
