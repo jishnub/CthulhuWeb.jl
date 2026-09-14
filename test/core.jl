@@ -44,6 +44,13 @@ function macroline(cf::Coefs, bs, tol, r, fr)
     return 0.0
 end
 
+# `a || return x` runs the return when `a` is false, `a && return x` when it is
+# true -- the shape of `crc isa NoSpace || return crc` in ApproxFunBase's
+# `union`, which was greyed as compiled out on the path it took.
+orreturn(x::Int)  = (x isa String || return x; x + 1)   # test false: returns
+andreturn(x::Int) = (x isa Int && return x; x + 1)      # test true: returns
+orskip(x::Int)    = (x isa Int || return x; x + 1)      # test true: skips
+
 # Two identical `length(v) > 8` on one line are ambiguous to `map_ssas_to_source`,
 # so the first operand comes back untyped next to a typed one. It ran -- nothing
 # after it could have otherwise -- and must not be greyed as short-circuited.
@@ -1455,6 +1462,22 @@ end
     @test enclosing_call_named(mc, "maximum", JuliaSyntax.sourcefile(call)) === call
     @test enclosing_call_named(mc, "Base.maximum", JuliaSyntax.sourcefile(call)) === call
     @test enclosing_call_named(mc, "sum", JuliaSyntax.sourcefile(call)) === nothing
+end
+
+@testset "a short-circuit operand is skipped only after a value that skips it" begin
+    cfg = headless_config(CONFIG; view=:source)
+    function dead(f)
+        s = Session(provider, find_method_instance(provider, f, Tuple{Int}); config=cfg)
+        return dead_regions(source_html(s, s.nodes[ROOT_ID], cfg))
+    end
+    for f in (orreturn, andreturn)
+        d = dead(f)
+        @test !any(r -> occursin("return x", r), d)      # the return ran...
+        @test any(r -> occursin("x + 1", r), d)          # ...so nothing after it does
+    end
+    d = dead(orskip)
+    @test any(r -> occursin("return x", r), d)           # skipped
+    @test !any(r -> occursin("x + 1", r), d)
 end
 
 @testset "an untyped operand before a typed one ran, and is not greyed" begin

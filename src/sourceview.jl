@@ -421,13 +421,16 @@ that position: `length(axes(bc)) == 0 ? fill!(similar(bc, typeof(r)), r) : r` in
 `broadcast_preserving_zero_d` has `r` untyped there, so neither arm could vouch
 for the other.
 
-**A sequence is dead only past its last live member.** The statements of a
-block and the operands of a short circuit run in order, so reaching a later one
-means every earlier one ran, typed or not. `ncoefficients(cf) > 8 && maximum(...)
-< 10tol*maxabsc && all(...)` in ApproxFunBase's `_default_Fun` came back with the
-first operand untyped -- Cthulhu could not place its two callsites -- and it was
-greyed as short-circuited while the operands it guards were typed. An untyped
-member before a typed one is unmapped, not unreachable.
+**A block is dead only past its last live statement.** Statements run in order,
+so reaching a later one means every earlier one ran, typed or not: an untyped
+statement before a typed one is unmapped, not unreachable.
+
+**A short-circuit operand is skipped only after a value that skips it.** `false`
+for `&&`, `true` for `||`, and nothing else: `crc isa NoSpace || return crc` with
+the test `Core.Const(false)` RUNS the return, and `ncoefficients(cf) > 8 &&
+maximum(...) < ... && all(...)` in ApproxFunBase's `_default_Fun` came back with
+its first operand untyped -- Cthulhu could not place its two callsites -- while
+the operands it guards were typed. Neither is compiled out.
 
 **A region a callsite is spelled in ran.** `ran(c)` is the caller's veto: where a
 callsite of this method has no source node and its callee is spelled by an
@@ -447,9 +450,17 @@ function collect_dead!(d::Set{Tuple{Int,Int}}, node; ran = n -> false)
     end
     v = k in CHOICE_PARENTS ? test_value(kids[1]) : nothing
     lasttyped = k in REGION_PARENTS ? something(findlast(has_typed_descendant, kids), 0) : 0
+    shortcircuit = k === K"&&" || k === K"||"
+    skipped = if shortcircuit
+        j = findfirst(c -> test_value(c) === (k === K"||"), kids)
+        j === nothing ? typemax(Int) : j + 1
+    else
+        typemax(Int)
+    end
     for (i, c) in enumerate(kids)
         untaken = (i == 2 && v === false) || (i == 3 && v === true)
-        dead = (live && i > lasttyped && is_dead_region(c)) ||
+        dead = shortcircuit ? (i >= skipped && is_dead_region(c)) :
+               (live && i > lasttyped && is_dead_region(c)) ||
                (untaken && !has_typed_descendant(c))
         if dead && !ran(c)
             push!(d, (first_byte(c), last_byte(c)))
