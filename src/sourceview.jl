@@ -1129,14 +1129,14 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
             end
             spantypes = span_types!(Dict{Tuple{Int,Int},String}(), tsn)
             for (key, ks) in cands
-                k = pick_callsite(s, ks, spannode[key], tsn.source,
+                k = pick_callsite(s, ks, spannode[key], sourcefile(tsn),
                                   get(spantypes, key, nothing), sparams)
                 # An optimized result attaches callsites by line, not by
                 # provenance, so a span can be handed a call it does not name.
                 # Keep only what the source confirms; the rest fall back to the
                 # unlocated list, where they are at least honestly placed.
                 if result.optimized && !names_this_callsite(s, k, spannode[key],
-                                                            tsn.source, sparams)
+                                                            sourcefile(tsn), sparams)
                     append!(unplaced, ks)
                     continue
                 end
@@ -1173,7 +1173,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
     # "Emptied" is literal, and that is the test: the emptied body spans no bytes
     # at all (`56:55`), where `= A` spans the one byte `A` sits on.
     kids_tsn = children(tsn)
-    idxend = lastindex(tsn.source)
+    idxend = lastindex(sourcefile(tsn))
     truncated = false
     body = nothing
     if kids_tsn !== nothing && length(kids_tsn) == 2
@@ -1204,13 +1204,13 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
     recognised = Set{Int}()
     unplaced = try
         body === nothing ? unplaced :
-            place_by_callee!(callsite_map, s, unplaced, body, tsn.source, sparams,
+            place_by_callee!(callsite_map, s, unplaced, body, sourcefile(tsn), sparams,
                              unowned, deadspans, recognised)
     catch
         unplaced
     end
 
-    src = tsn.source
+    src = sourcefile(tsn)
     startb = first_byte(tsn)
     unverified = collect_unverified!(Set{Tuple{Int,Int}}(), tsn, callsite_map, false)
     inlined && distrust_body!(unverified, body, callsite_map)

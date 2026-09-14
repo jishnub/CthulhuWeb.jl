@@ -8,43 +8,34 @@ const NodeId = Int
 const ROOT_ID = 1
 
 # ---------------------------------------------------------------------------
-# Compiler-integration module resolution.
+# Compiler-integration duck typing.
 #
 # src/compiler/*.jl is included into `Cthulhu` and, when the Compiler stdlib
-# diverges from Base.Compiler, AGAIN into CthulhuCompilerExt. `get_ci`/`get_rt`/
-# `get_override`/`lookup`/`find_callsites` are shared generics (imported at
-# src/CthulhuCompiler.jl:3), but `get_effects` and `get_exct` are NOT -- the
-# former is defined fresh at src/CthulhuCompiler.jl:28. So the CallInfo types and
-# those two accessors must be taken from whichever module actually produced the
-# data. Deriving it from the data needs no `use_compiler_stdlib` guesswork.
+# diverges from Base.Compiler, AGAIN into CthulhuCompilerExt, so the same
+# CallInfo type name can live in either module. Resolving a fixed set of types
+# via `getglobal` made any upstream rename throw inside `Session()`; classify
+# by `nameof(typeof(info))` instead and fall back to `:edge` for anything
+# unrecognised. `get_effects`/`get_exct` are NOT shared generics (the former is
+# defined fresh at src/CthulhuCompiler.jl:28), so those two are still resolved
+# from `parentmodule(typeof(info))`, but lazily and guarded.
 # ---------------------------------------------------------------------------
-struct Integration
-    M::Module
-    MultiCallInfo::Type
-    RTCallInfo::Type
-    PureCallInfo::Type
-    TaskCallInfo::Type
-    FailedCallInfo::Type
-    GeneratedCallInfo::Type
-    ConstPropCallInfo::Type
-    SemiConcreteCallInfo::Type
-    ConcreteCallInfo::Type
-    ReturnTypeCallInfo::Type
-    InvokeCallInfo::Type
-    OCCallInfo::Type
-    WrappedCallInfo::Type
-    get_effects::Function
-    get_exct::Function
-    ignorewrappers::Function
-end
+const CALLINFO_KINDS = Dict{Symbol,Symbol}(
+    :MultiCallInfo => :multi, :RTCallInfo => :runtime, :PureCallInfo => :pure,
+    :TaskCallInfo => :task, :ConstPropCallInfo => :constprop,
+    :SemiConcreteCallInfo => :semiconcrete, :ConcreteCallInfo => :concrete,
+    :ReturnTypeCallInfo => :returntype, :InvokeCallInfo => :invoke,
+    :OCCallInfo => :oc, :FailedCallInfo => :failed, :GeneratedCallInfo => :generated)
+callinfo_kind(@nospecialize(info)) = get(CALLINFO_KINDS, nameof(typeof(info)), :edge)
 
-const _INTEG_NAMES = (:MultiCallInfo, :RTCallInfo, :PureCallInfo, :TaskCallInfo,
-    :FailedCallInfo, :GeneratedCallInfo, :ConstPropCallInfo, :SemiConcreteCallInfo,
-    :ConcreteCallInfo, :ReturnTypeCallInfo, :InvokeCallInfo, :OCCallInfo,
-    :WrappedCallInfo, :get_effects, :get_exct, :ignorewrappers)
+"Cthulhu's WrappedCallInfo/LimitedCallInfo (compiler/callsite.jl:22-35) both hold
+a single `wrapped` field; peel through however many are stacked."
+unwrap_limited(@nospecialize(info)) =
+    hasproperty(info, :wrapped) ? unwrap_limited(info.wrapped) : info
 
-Integration(M::Module) = Integration(M, (getglobal(M, n) for n in _INTEG_NAMES)...)
-integration_for(result) = Integration(parentmodule(typeof(result)))
+"Resolve `name` from whichever module actually produced `info`, or `nothing`
+if that module doesn't define it (renamed/removed upstream)."
+upstream_fn(@nospecialize(info), name::Symbol) =
+    (M = parentmodule(typeof(info)); isdefined(M, name) ? getglobal(M, name) : nothing)
 
 # ---------------------------------------------------------------------------
 # Guarded accessors. Several of these throw or warn in normal operation.
@@ -63,15 +54,15 @@ function try_get_ci(@nospecialize(info))
     end
 end
 
-safe_string(f, @nospecialize(x)) = try string(f(x)) catch; nothing end
+safe_string(f, @nospecialize(x)) = f === nothing ? nothing : (try string(f(x)) catch; nothing end)
 
 "get_effects(::MultiCallInfo) is a mapreduce with no `init` (callsite.jl:100) and
 throws on empty callinfos, which descend.jl:172-176 shows does happen."
-safe_effects(integ::Integration, @nospecialize(info)) = safe_string(integ.get_effects, info)
+safe_effects(@nospecialize(info)) = safe_string(upstream_fn(info, :get_effects), info)
 
 "get_exct(::ConcreteCallInfo) is a live bug -- callsite.jl:154 binds `cici` but
 references `ceci`, so it throws UndefVarError. The TUI never calls it."
-safe_exct(integ::Integration, @nospecialize(info)) = safe_string(integ.get_exct, info)
+safe_exct(@nospecialize(info)) = safe_string(upstream_fn(info, :get_exct), info)
 
 # ---------------------------------------------------------------------------
 # Node + Session
@@ -126,7 +117,6 @@ end
 
 mutable struct Session
     const provider::AbstractProvider
-    const integ::Integration
     config::CthulhuConfig
     const nodes::Vector{Node}
     const byslot::Dict{SlotKey,NodeId}
@@ -159,14 +149,13 @@ function Session(provider::AbstractProvider, mi::Core.MethodInstance;
     ci = generate_code_instance(provider, mi)
     result = lookup(provider, ci, config.optimize)
     result === nothing && error("Initial lookup failed for $mi")
-    integ = integration_for(result)
 
     label = CallLabel(:root, Symbol[], sprint(show, mi), String[], String[], string(result.rt),
                       nothing, nothing, false, false, -1, :call, 0,
                       whereis_file(mi)..., )
     root = Node(ROOT_ID, 0, 0, mi, ci, nothing, nothing, label, true, true, 0,
                 Dict{Bool,Vector{NodeId}}(), Dict{Bool,String}())
-    s = Session(provider, integ, config, Node[root], Dict{SlotKey,NodeId}(),
+    s = Session(provider, config, Node[root], Dict{SlotKey,NodeId}(),
                 IdDict{Any,Dict{Bool,Any}}(), Dict{Tuple{NodeId,UInt},String}(), max_depth)
     s.results[ci] = Dict{Bool,Any}(config.optimize => result)
     return s
@@ -200,36 +189,39 @@ end
 # Classification. Mirrors descend.jl:118-149 but never lets get_ci throw.
 # ---------------------------------------------------------------------------
 function classify(s::Session, @nospecialize(info))
-    integ = s.integ
-    inner = integ.ignorewrappers(info)
+    inner = unwrap_limited(info)
     wrappers = Symbol[]
     info !== inner && push!(wrappers, :limited)
 
-    if inner isa integ.MultiCallInfo
-        n = length(inner.callinfos)
+    kind0 = callinfo_kind(inner)
+
+    if kind0 === :multi
+        cis = hasproperty(inner, :callinfos) ? inner.callinfos : []
+        n = length(cis)
         return (kind=:multi, wrappers, mi=nothing, ci=nothing, override=nothing,
                 descendable=false, expandable=(n > 0), nalt=n)
     end
 
     # RTCallInfo: get_ci === nothing by definition; the TUI refuses descent
     # (descend.jl:129-133). PureCallInfo likewise has no ci.
-    if inner isa integ.RTCallInfo || inner isa integ.PureCallInfo
-        return (kind=(inner isa integ.RTCallInfo ? :runtime : :pure), wrappers,
-                mi=nothing, ci=nothing, override=nothing,
+    if kind0 === :runtime || kind0 === :pure
+        return (kind=kind0, wrappers, mi=nothing, ci=nothing, override=nothing,
                 descendable=false, expandable=false, nalt=0)
     end
 
-    if inner isa integ.TaskCallInfo
+    if kind0 === :task
         push!(wrappers, :task)
-        wrapped = integ.ignorewrappers(inner.ci)
-        if wrapped isa integ.MultiCallInfo
+        taskci = hasproperty(inner, :ci) ? inner.ci : nothing
+        wrapped = taskci === nothing ? nothing : unwrap_limited(taskci)
+        if wrapped !== nothing && callinfo_kind(wrapped) === :multi
             # `callinfo()` (reflection.jl:289) really can return a MultiCallInfo
             # here; descend.jl:126's `::CodeInstance` assertion would throw.
-            n = length(wrapped.callinfos)
+            cis = hasproperty(wrapped, :callinfos) ? wrapped.callinfos : []
+            n = length(cis)
             return (kind=:task_multi, wrappers, mi=nothing, ci=nothing, override=nothing,
                     descendable=false, expandable=(n > 0), nalt=n)
         end
-        ci = try_get_ci(wrapped)
+        ci = wrapped === nothing ? nothing : try_get_ci(wrapped)
         # NB: descend.jl:126 sets state.ci but NOT state.mi -- an upstream bug that
         # makes the renderers use the parent's mi with the task's ci. Set both.
         return (kind=:task, wrappers, mi=(ci === nothing ? nothing : get_mi(ci)), ci,
@@ -245,14 +237,7 @@ function classify(s::Session, @nospecialize(info))
     override = get_override(s.provider, info)
 
     ci !== nothing && is_kwcall(get_mi(ci)) && push!(wrappers, :kw)
-    kind = inner isa integ.ConstPropCallInfo    ? :constprop    :
-           inner isa integ.SemiConcreteCallInfo ? :semiconcrete :
-           inner isa integ.ConcreteCallInfo     ? :concrete     :
-           inner isa integ.ReturnTypeCallInfo   ? :returntype   :
-           inner isa integ.InvokeCallInfo       ? :invoke       :
-           inner isa integ.OCCallInfo           ? :oc           :
-           inner isa integ.FailedCallInfo       ? :failed       :
-           inner isa integ.GeneratedCallInfo    ? :generated    : :edge
+    kind = kind0   # constprop/semiconcrete/concrete/returntype/invoke/oc/failed/generated/edge
 
     # descend.jl:138: `ci === nothing && override === nothing && continue`. The TUI
     # still DISPLAYS such a callsite (the menu is built from all of them,
@@ -268,12 +253,11 @@ end
 # real information (compiler/callsite.jl:206).
 # ---------------------------------------------------------------------------
 function make_label(s::Session, @nospecialize(info), c, stmt_id::Int, head::Symbol)
-    integ = s.integ
     rt = try get_rt(info) catch; Any end
     name, argtypes, kwargs = signature_parts(s, info, c)
     file, line = whereis_file(c.mi)
     return CallLabel(c.kind, c.wrappers, name, argtypes, kwargs, string(rt),
-                     safe_exct(integ, info), safe_effects(integ, info),
+                     safe_exct(info), safe_effects(info),
                      is_type_unstable(rt), is_expected_union_safe(rt),
                      stmt_id, head, c.nalt, file, line)
 end
@@ -284,24 +268,25 @@ is_expected_union_safe(@nospecialize(rt)) =
 "Recover (function name, argument types) from the callee's specTypes when we have
 one, else from the CallInfo's own `sig`/`argtyps` fields."
 function signature_parts(s::Session, @nospecialize(info), c)
-    integ = s.integ
-    inner = integ.ignorewrappers(info)
+    inner = unwrap_limited(info)
+    kind0 = callinfo_kind(inner)
 
     if c.mi !== nothing
         kw = kwcall_parts(c.mi.specTypes)
         kw === nothing || return kw
         return tuple_to_parts(c.mi.specTypes)
     end
-    if inner isa integ.MultiCallInfo
-        return tuple_to_parts(inner.sig)
+    if kind0 === :multi
+        return tuple_to_parts(hasproperty(inner, :sig) ? inner.sig : Tuple{})
     end
-    if inner isa integ.RTCallInfo
-        f = inner.f
+    if kind0 === :runtime
+        f = hasproperty(inner, :f) ? inner.f : nothing
         nm = f isa Type ? string(f) : string(nameof_safe(f))
-        return (nm, String[string(T) for T in inner.argtyps], String[])
+        ats = hasproperty(inner, :argtyps) ? inner.argtyps : []
+        return (nm, String[string(T) for T in ats], String[])
     end
-    if inner isa integ.PureCallInfo
-        ats = inner.argtypes
+    if kind0 === :pure
+        ats = hasproperty(inner, :argtypes) ? inner.argtypes : []
         nm = isempty(ats) ? "?" : type_head_name(first(ats))
         return (nm, String[string(T) for T in ats[2:end]], String[])
     end
@@ -446,9 +431,10 @@ function expand!(s::Session, id::NodeId; optimize::Bool = s.config.optimize)
         if node.label.kind === :multi || node.label.kind === :task_multi
             # No lookup needed. Mirrors select_callsite (descend.jl:166-188): the
             # alternatives inherit the parent's stmt_id and head.
-            inner = s.integ.ignorewrappers(node.info)
-            infos = node.label.kind === :multi ? inner.callinfos :
-                    s.integ.ignorewrappers(inner.ci).callinfos
+            inner = unwrap_limited(node.info)
+            src = node.label.kind === :multi ? inner :
+                  (hasproperty(inner, :ci) ? unwrap_limited(inner.ci) : nothing)
+            infos = src !== nothing && hasproperty(src, :callinfos) ? src.callinfos : []
             for (i, sub) in enumerate(infos)
                 push!(kids, intern_child!(s, node, sub, node.label.stmt_id,
                                           node.label.head, i, optimize))

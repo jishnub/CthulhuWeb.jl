@@ -313,7 +313,6 @@ mi = find_method_instance(provider, f, Tuple{})
 @testset "session core" begin
     s = Session(provider, mi)
     @test s.nodes[ROOT_ID].label.kind === :root
-    @test s.integ.M === Cthulhu || nameof(s.integ.M) === :CthulhuCompilerExt
 
     kids = expand!(s, ROOT_ID)
     @test !isempty(kids)
