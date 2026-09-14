@@ -396,12 +396,13 @@ function descend_web(@nospecialize(args...); port::Union{Nothing,Int} = nothing,
     # so the whole UI lives on a single port.
     function apphandler(stream::HTTP.Stream)
         req = stream.message
-        if HTTP.WebSockets.isupgrade(req)
+        upgrade = HTTP.WebSockets.isupgrade(req)
+        if upgrade && origin_allowed(req, port)
             return HTTP.WebSockets.upgrade(stream) do ws
                 serve_ws(ws, session_task)
             end
         end
-        resp = static_handler(req)
+        resp = upgrade ? HTTP.Response(403, "forbidden origin") : static_handler(req)
         HTTP.setstatus(stream, resp.status)
         for (k, v) in resp.headers
             HTTP.setheader(stream, k => v)
@@ -428,6 +429,16 @@ function descend_web(@nospecialize(args...); port::Union{Nothing,Int} = nothing,
     # dumps the whole Session, LookupResult and CodeInfo. The server is kept in
     # `SERVERS` and torn down with `stop_web()`.
     return nothing
+end
+
+"""
+Browsers exempt WebSockets from CORS, so without this any page open in the
+browser could connect to the port, drive the session and read the source it
+shows. Only our own page may. Non-browser clients send no `Origin` and pass.
+"""
+function origin_allowed(req::HTTP.Request, port::Int)
+    o = HTTP.header(req, "Origin")
+    return isempty(o) || o in ("http://localhost:$port", "http://127.0.0.1:$port")
 end
 
 _resolve_mi(provider, mi::Core.MethodInstance) = mi
@@ -463,11 +474,12 @@ function serve_ws(ws, session_task::Task)
             return
         end
 
-        # seed the client
-        put!(outbox, JSON.json(Dict{String,Any}(
+        # seed the client -- on the worker, like every other read of the session:
+        # another tab's expand may be push!ing to `session.nodes` right now
+        put!(outbox, JSON.json(on_worker(() -> Dict{String,Any}(
             "op" => "init",
             "root" => node_record(session, ROOT_ID),
-            "config" => config_record(session.config))))
+            "config" => config_record(session.config)))))
 
         for raw in ws
             msg = try

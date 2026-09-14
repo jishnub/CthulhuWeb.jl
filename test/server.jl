@@ -39,6 +39,15 @@ try
                        status_exception=false).status == 404
     end
 
+    @testset "foreign origins cannot open the socket" begin
+        @test_throws Exception HTTP.WebSockets.open(identity, "ws://localhost:$PORT/";
+            headers=["Origin" => "http://evil.example"])
+        HTTP.WebSockets.open("ws://localhost:$PORT/";
+                             headers=["Origin" => "http://localhost:$PORT"]) do ws
+            @test JSON.parse(first(ws)).op in ("init", "initializing")
+        end
+    end
+
     @testset "websocket session" begin
         HTTP.WebSockets.open("ws://localhost:$PORT/") do ws
             # server seeds the client

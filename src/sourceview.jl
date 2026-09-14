@@ -87,8 +87,10 @@ function token_classmap(src, first_b::Int, last_b::Int)
                 cm[i] = c
             end
         end
-    catch
-        # unparseable fragment: fall back to no lexical highlighting
+    catch err
+        # `tokenize` is total on Julia text, so this is a bug, not bad input.
+        # Fall back to no highlighting, but say so.
+        @warn "syntax highlighting failed" exception=(err, catch_backtrace())
     end
     return cm
 end
@@ -840,8 +842,9 @@ function source_tokens(text::AbstractString)
             (is_operator(k) || k === K"Identifier") || continue
             push!(out, untokenize(t, text))
         end
-    catch
-        # unlexable fragment: report nothing rather than guess
+    catch err
+        # report nothing rather than guess -- but `tokenize` is total, so warn
+        @warn "source token scan failed" exception=(err, catch_backtrace())
     end
     return out
 end
@@ -1094,7 +1097,9 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
     tsn = try
         t, _ = get_typed_sourcetext(node.mi, result.src, result.rt)
         t
-    catch
+    catch err
+        # expected for macro-generated code and missing files; debug, not warn
+        @debug "no typed source" node.mi exception=(err, catch_backtrace())
         nothing
     end
     tsn === nothing && return nothing
@@ -1158,8 +1163,11 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
                                      unstable = l.unstable, union = l.expected_union)
             end
         end
-    catch
-        # annotation is best-effort; the un-clickable source is still useful
+    catch err
+        # annotation is best-effort; the un-clickable source is still useful.
+        # Warn rather than swallow: a broken mapping looks exactly like a method
+        # with nothing to click, and that is how bugs here hide.
+        @warn "callsite mapping failed" node.mi exception=(err, catch_backtrace())
     end
 
     # Mirrors cthulhu_typed (codeview.jl:110-118): a method that only fills in
@@ -1206,7 +1214,8 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
         body === nothing ? unplaced :
             place_by_callee!(callsite_map, s, unplaced, body, sourcefile(tsn), sparams,
                              unowned, deadspans, recognised)
-    catch
+    catch err
+        @warn "placing unlocated callsites failed" node.mi exception=(err, catch_backtrace())
         unplaced
     end
 
