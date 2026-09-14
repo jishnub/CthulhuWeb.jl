@@ -1,7 +1,7 @@
 # End-to-end test: boots the real server and drives it over a real WebSocket.
 # Run with:  julia --project=web --startup-file=no web/test_server.jl
 using Test
-using HTTP, JSON3
+using HTTP, JSON
 using CthulhuWeb
 using CthulhuWeb: AUTO_PORT, DEFAULT_PORT, ESC, SERVERS, SESSIONS, pick_port,
                   port_free, session_text
@@ -17,9 +17,9 @@ sleep(1.0)
 "Send one op and wait for the matching reply, skipping acks."
 function rpc(ws, op; kw...)
     req = rand(1:10^6)
-    HTTP.WebSockets.send(ws, JSON3.write(Dict("op"=>op, "req"=>req, kw...)))
+    HTTP.WebSockets.send(ws, JSON.json(Dict("op"=>op, "req"=>req, kw...)))
     for raw in ws
-        msg = JSON3.read(raw)
+        msg = JSON.parse(raw)
         get(msg, :op, "") == "ack" && continue
         return msg
     end
@@ -42,7 +42,7 @@ try
     @testset "websocket session" begin
         HTTP.WebSockets.open("ws://localhost:$PORT/") do ws
             # server seeds the client
-            init = JSON3.read(first(ws))
+            init = JSON.parse(first(ws))
             @test init.op == "init"
             @test init.root.kind == "root"
             @test init.config.view == "typed"
@@ -149,7 +149,7 @@ try
             @test haskey(SERVERS, 8766)
 
             HTTP.WebSockets.open("ws://localhost:8766/") do ws
-                init = JSON3.read(first(ws))
+                init = JSON.parse(first(ws))
                 @test occursin("usermacro", init.root.name)
                 @test init.config.view == "source"     # macro kwargs reached the config
                 @test init.config.iswarn == true
@@ -206,7 +206,7 @@ try
             # and the replacement really serves
             @test HTTP.get("http://localhost:8794/"; status_exception=false).status == 200
             HTTP.WebSockets.open("ws://localhost:8794/") do ws
-                @test occursin("f2", JSON3.read(first(ws)).root.name)
+                @test occursin("f2", JSON.parse(first(ws)).root.name)
             end
         finally
             close(held)
@@ -231,7 +231,7 @@ try
                 j = rpc(ws, "export"; id=1, expanded=[1], format="json")
                 @test j.op == "export"
                 @test endswith(j.filename, ".json")
-                doc = JSON3.read(j.payload)
+                doc = JSON.parse(j.payload)
                 @test doc.cthulhuweb == CthulhuWeb.EXPORT_VERSION
                 @test doc.open == 1
                 @test doc.expanded == [1]          # only the browser knows this
@@ -289,7 +289,7 @@ try
             @test haskey(SERVERS, chosen)
             @test !haskey(SERVERS, DEFAULT_PORT)   # not a second server
             HTTP.WebSockets.open("ws://localhost:$chosen/") do ws
-                @test occursin("f3", JSON3.read(first(ws)).root.name)
+                @test occursin("f3", JSON.parse(first(ws)).root.name)
             end
 
             # An explicit port is how trees run side by side, so it must not
@@ -322,7 +322,7 @@ try
             ops = String[]
             HTTP.WebSockets.open("ws://localhost:8793/") do ws
                 for raw in ws
-                    m = JSON3.read(raw)
+                    m = JSON.parse(raw)
                     push!(ops, String(get(m, :op, "")))
                     last(ops) in ("init", "error") && break
                 end
@@ -341,11 +341,11 @@ try
         # still ack promptly and before the result, so a slow inference never
         # looks like a dropped connection.
         HTTP.WebSockets.open("ws://localhost:$PORT/") do ws
-            JSON3.read(first(ws))
-            HTTP.WebSockets.send(ws, JSON3.write(Dict("op"=>"expand","req"=>4242,"id"=>1)))
+            JSON.parse(first(ws))
+            HTTP.WebSockets.send(ws, JSON.json(Dict("op"=>"expand","req"=>4242,"id"=>1)))
             saw_ack = false
             for raw in ws
-                m = JSON3.read(raw)
+                m = JSON.parse(raw)
                 if get(m, :op, "") == "ack"
                     @test m.req == 4242
                     saw_ack = true

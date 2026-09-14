@@ -140,7 +140,7 @@ function op_export(s::Session, id::NodeId, expanded::Vector{NodeId}, fmt::String
         "op"       => "export",
         "format"   => fmt,
         "filename" => export_filename(s, fmt),
-        "payload"  => fmt == "text" ? session_text(doc) : JSON3.write(doc),
+        "payload"  => fmt == "text" ? session_text(doc) : JSON.json(doc),
     )
 end
 
@@ -324,7 +324,7 @@ function export_web(path::Union{Nothing,AbstractString} = nothing;
     # On the worker like every other analysis: rendering a body can still infer.
     out = on_worker() do
         doc = session_document(session, id)
-        text ? session_text(doc) : JSON3.write(doc)
+        text ? session_text(doc) : JSON.json(doc)
     end
     out isa AbstractString || error("could not build the export: $out")
     dest = path === nothing ? export_filename(session, text ? "text" : "json") : String(path)
@@ -452,40 +452,40 @@ function serve_ws(ws, session_task::Task)
         # The page is reachable before analysis finishes; say so rather than
         # leaving the browser staring at an empty tree.
         istaskdone(session_task) ||
-            put!(outbox, JSON3.write(Dict{String,Any}("op" => "initializing")))
+            put!(outbox, JSON.json(Dict{String,Any}("op" => "initializing")))
 
         session = try
             fetch(session_task)
         catch err
             e = err isa TaskFailedException ? err.task.exception : err
-            isopen(outbox) && put!(outbox, JSON3.write(Dict{String,Any}(
+            isopen(outbox) && put!(outbox, JSON.json(Dict{String,Any}(
                 "op" => "error", "msg" => sprint(showerror, e))))
             return
         end
 
         # seed the client
-        put!(outbox, JSON3.write(Dict{String,Any}(
+        put!(outbox, JSON.json(Dict{String,Any}(
             "op" => "init",
             "root" => node_record(session, ROOT_ID),
             "config" => config_record(session.config))))
 
         for raw in ws
             msg = try
-                JSON3.read(raw)
+                JSON.parse(raw)
             catch err
-                put!(outbox, JSON3.write(Dict("op"=>"error","msg"=>"bad JSON")))
+                put!(outbox, JSON.json(Dict("op"=>"error","msg"=>"bad JSON")))
                 continue
             end
             req = get(msg, :req, nothing)
             # ack immediately so the UI can show a spinner while inference runs
-            req === nothing || put!(outbox, JSON3.write(Dict("op"=>"ack","req"=>req)))
+            req === nothing || put!(outbox, JSON.json(Dict("op"=>"ack","req"=>req)))
             @async begin
                 out = on_worker(() -> handle(session, msg))
                 out isa AbstractDict && req !== nothing && (out = merge(out, Dict("req"=>req)))
                 # The viewer may have closed the tab while this was computing;
                 # `isopen` alone races with the writer shutting down.
                 try
-                    isopen(outbox) && put!(outbox, JSON3.write(out))
+                    isopen(outbox) && put!(outbox, JSON.json(out))
                 catch
                 end
             end

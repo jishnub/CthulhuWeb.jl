@@ -6,7 +6,7 @@ using Cthulhu: CONFIG, CthulhuConfig, CthulhuState, AbstractProvider,
 using CthulhuWeb
 using LinearAlgebra: LinearAlgebra
 using JuliaSyntax: JuliaSyntax, @K_str, children, first_byte, kind, last_byte
-using JSON3: JSON3
+using JSON: JSON
 # internals under test
 using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ansi_to_html, expand!,
                   headless_config, lookup_cached!, node_record, render_body,
@@ -944,7 +944,7 @@ end
 
     # A file written today has to read the same when it is loaded back.
     mktemp() do path, io
-        write(io, JSON3.write(doc)); close(io)
+        write(io, JSON.json(doc)); close(io)
         ws = load_session(path)
         @test session_text(ws) == txt
         @test ws["open"] == bid

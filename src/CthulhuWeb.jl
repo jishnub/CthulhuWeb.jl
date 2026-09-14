@@ -37,7 +37,7 @@ using InteractiveUtils: InteractiveUtils, is_expected_union
 using Logging: Logging, NullLogger, with_logger
 using REPL
 using HTTP
-using JSON3
+using JSON
 using Sockets
 
 export descend_web, @descend_web, stop_web, web_status, export_web, load_session

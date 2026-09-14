@@ -322,7 +322,7 @@ end
 """
     load_session(path) -> WebSession
 
-Read an exported session. `ws.doc` is the raw document (a `JSON3.Object`, so
+Read an exported session. `ws.doc` is the raw document (a `JSON.Object`, so
 `ws.doc["nodes"]`, `ws.doc["source"]["spans"]` and so on); showing it prints the
 readable rendering, which is what to paste into a conversation.
 """
@@ -330,7 +330,7 @@ struct WebSession
     doc::Any
 end
 
-load_session(path::AbstractString) = WebSession(JSON3.read(read(path, String)))
+load_session(path::AbstractString) = WebSession(JSON.parse(read(path, String)))
 
 Base.show(io::IO, ::MIME"text/plain", ws::WebSession) = print(io, session_text(ws.doc))
 Base.show(io::IO, ws::WebSession) =
