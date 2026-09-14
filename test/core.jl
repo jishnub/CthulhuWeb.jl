@@ -433,6 +433,14 @@ end
         # balanced spans
         @test nspan == length(collect(eachmatch(r"</span>", html)))
     end
+
+    # `cthulhu_ast` needs Revise and says so with a @warn, writing nothing to the
+    # stream. The page must carry the reason, not an empty pane.
+    @test !isdefined(Main, :Revise)
+    ahtml = render_body(s, s.nodes[ROOT_ID], headless_config(CONFIG; view=:ast))
+    @test occursin("<p class=\"note\">Warning: Could not retrieve AST", ahtml)
+    @test occursin("requires Revise.jl", ahtml)
+    @test !occursin("└ @", ahtml)
 end
 
 @testset "source view" begin

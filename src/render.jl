@@ -190,23 +190,36 @@ function render_body(s::Session, node::Node, cfg::CthulhuConfig)
     state = CthulhuState(s.provider; terminal=NULL_TERMINAL[], config=cfg,
                          ci=node.ci, mi=node.mi, override=node.override)
 
+    # Cthulhu reports some failures by `@warn` and writes nothing to the stream --
+    # `cthulhu_ast` without Revise loaded, for one -- which in a terminal sits
+    # right above the empty output and in a browser is an empty pane with the
+    # reason in the REPL. Catch what it logs and put it in the pane.
+    logbuf = IOBuffer()
     ansi = try
-        # NB: stringify(f, ::IOContext) does NOT add :color=>true (ui.jl:98 only
-        # does so for the ::IO method). Without it you silently get plain text.
-        stringify(IOContext(IOBuffer(),
-                :color            => true,
-                :limit            => true,
-                :displaysize      => (40, 200),
-                :SOURCE_SLOTNAMES => source_slotnames(result),
-                :effects          => cfg.effects,
-                :exception_types  => cfg.exception_types)) do io
-            view_function(state)(io, s.provider, state, result)
+        with_logger(SimpleLogger(logbuf, Logging.Warn)) do
+            # NB: stringify(f, ::IOContext) does NOT add :color=>true (ui.jl:98
+            # only does so for the ::IO method). Without it you silently get
+            # plain text.
+            stringify(IOContext(IOBuffer(),
+                    :color            => true,
+                    :limit            => true,
+                    :displaysize      => (40, 200),
+                    :SOURCE_SLOTNAMES => source_slotnames(result),
+                    :effects          => cfg.effects,
+                    :exception_types  => cfg.exception_types)) do io
+                view_function(state)(io, s.provider, state, result)
+            end
         end
     catch err
         return "<p class=\"err\">" * html_escape(sprint(showerror, err)) * "</p>"
     end
 
-    html = "<pre class=\"code\">" * ansi_to_html(ansi) * "</pre>"
+    # `┌ Warning: msg\n└ @ Module file:line` -> `Warning: msg`
+    logged = strip(replace(String(take!(logbuf)), r"\n└ @ [^\n]*" => "", r"^┌ "m => ""))
+    isempty(logged) && isempty(strip(ansi)) &&
+        (logged = "Cthulhu produced no output for the " * string(cfg.view) * " view.")
+    note = isempty(logged) ? "" : "<p class=\"note\">" * html_escape(logged) * "</p>"
+    html = note * "<pre class=\"code\">" * ansi_to_html(ansi) * "</pre>"
     s.bodies[key] = html
     return html
 end

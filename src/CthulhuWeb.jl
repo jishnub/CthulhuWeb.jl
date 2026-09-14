@@ -34,7 +34,7 @@ using JuliaSyntax: JuliaSyntax, @K_str, children, first_byte, is_dotted,
 using TypedSyntax: TypedSyntax, is_runtime
 using CodeTracking: CodeTracking
 using InteractiveUtils: InteractiveUtils, is_expected_union
-using Logging: Logging, NullLogger, with_logger
+using Logging: Logging, NullLogger, SimpleLogger, with_logger
 using REPL
 using HTTP
 using JSON
