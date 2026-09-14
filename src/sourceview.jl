@@ -377,13 +377,21 @@ types, the arm that actually runs included, and greying them all would say the
 method does nothing. That is the same mistake as greying `_chkstride1`, one level
 down. The parent kind matters too: in `tag = if ...` the typed `tag` is the
 folded *result*, not evidence that any arm ran.
+
+An `if` with no `else` has a second way to be resolved: its test folded to
+`false`. Then its one arm was not taken and no arm can be live to prove it -- the
+live sibling is the fall-through. `bc.f === identity && bc.args isa Tuple{...}`
+in `copyto!(dest, bc::Broadcasted{Nothing})` is `Core.Const(false)` on the
+first operand, and the whole `if` body was rendered at full strength.
 """
 function collect_dead!(d::Set{Tuple{Int,Int}}, node)
     kids = children(node)
     kids === nothing && return d
     k = kind(node)
     live = if k in CHOICE_PARENTS
-        branch_resolved(node) && any(arm_taken, conditional_arms(node))
+        branch_resolved(node) &&
+            (any(arm_taken, conditional_arms(node)) ||
+             (length(kids) == 2 && test_is_false(kids[1])))
     else
         k in REGION_PARENTS && any(has_typed_descendant, kids)
     end
@@ -395,6 +403,25 @@ function collect_dead!(d::Set{Tuple{Int,Int}}, node)
         end
     end
     return d
+end
+
+"""
+Did this test fold to `false`?
+
+`&&` carries no type of its own -- it lowers to a branch, not a value -- so read
+its operands: one that is `Core.Const(false)` decides it, whether the rest were
+compiled out after it or ran before it. `||` is false only if every operand is.
+"""
+function test_is_false(node)
+    t = node.typ
+    t isa Core.Const && return t.val === false
+    kids = children(node)
+    (t !== nothing || kids === nothing) && return false
+    k = kind(node)
+    k === K"&&" && return any(test_is_false, kids)
+    k === K"||" && return all(test_is_false, kids)
+    k === K"parens" && return length(kids) == 1 && test_is_false(kids[1])
+    return false
 end
 
 function has_typed_descendant(node)

@@ -24,6 +24,10 @@ using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ans
 f() = (T = rand() > 0.5 ? Int64 : Float64; sin(rand(T)))
 rec(n) = n <= 1 ? 1 : n * rec(n - 1)
 
+# No `else`, so no arm can be live to prove the branch was decided; the test
+# folding to `false` is the proof, through an `&&` that carries no type itself.
+noelse(x) = (if x === identity && x isa Function; return abs(x); end; x + 1)
+
 struct TPBox{A,B}; a::A; b::B; end
 tp_combine(p::TPBox{A,B}, q::A) where {A,B} = (p.a, q)
 
@@ -1327,6 +1331,18 @@ end
     ms2 = Session(provider, mmi2; config=cfg)
     @test source_html(ms2, ms2.nodes[ROOT_ID], cfg) !== nothing
 end
+@testset "a no-else if whose test folded to false is greyed" begin
+    cfg = headless_config(CONFIG; view=:source)
+    nmi = find_method_instance(provider, noelse, Tuple{Int})
+    s = Session(provider, nmi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    dead = dead_regions(html)
+    @test any(r -> occursin("return abs(x)", r), dead)      # the arm
+    @test any(r -> occursin("x isa Function", r), dead)     # the short-circuited operand
+    @test !any(r -> occursin("x + 1", r), dead)             # the fall-through stays live
+    @test !any(r -> occursin("x === identity", r), dead)    # the test ran
+end
+
 @testset "code compiled out is greyed, not silently normal" begin
     cfg = headless_config(CONFIG; view=:source, iswarn=true)
     dmi = find_method_instance(provider, deadbranch, Tuple{Tuple{Int,Int}})
