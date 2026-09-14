@@ -28,6 +28,20 @@ rec(n) = n <= 1 ? 1 : n * rec(n - 1)
 # folding to `false` is the proof, through an `&&` that carries no type itself.
 noelse(x) = (if x === identity && x isa Function; return abs(x); end; x + 1)
 
+# Everything after a taken arm that returns is unreachable -- the shape of
+# `copy(::Broadcasted)` once `isconcretetype(ElType)` is known. Assignments and
+# macro calls included, not just the calls and returns among them.
+function afterreturn(x)
+    T = eltype(x)
+    if isconcretetype(T)
+        return similar(x, T)
+    end
+    y = x .+ 1
+    z = length(y)
+    @inbounds w = y[1]
+    return z + w
+end
+
 struct TPBox{A,B}; a::A; b::B; end
 tp_combine(p::TPBox{A,B}, q::A) where {A,B} = (p.a, q)
 
@@ -1370,6 +1384,21 @@ end
     @test any(r -> occursin("fill!(similar(r), 0.0)", r), zdead)
     @test !any(r -> occursin("length(axes(r)) == 0", r), zdead)
     @test length(zdead) == 1                                # `r` is not greyed
+end
+
+@testset "code after a taken arm's return is greyed, assignments included" begin
+    cfg = headless_config(CONFIG; view=:source)
+    ami = find_method_instance(provider, afterreturn, Tuple{Matrix{Float64}})
+    a = Session(provider, ami; config=cfg)
+    html = source_html(a, a.nodes[ROOT_ID], cfg)
+    dead = join(dead_regions(html), "\n")
+    for stmt in ("y = x .+ 1", "z = length(y)", "@inbounds w = y[1]", "return z + w")
+        @test occursin(stmt, dead)
+    end
+    @test !occursin("similar(x, T)", dead)          # the arm that ran
+    @test !occursin("T = eltype(x)", dead)
+    # a slot nothing reachable assigns has type `Union{}`; no read is told that
+    @test !occursin("::Union{}", html)
 end
 
 @testset "a variable read with no type of its own reports its slot's" begin

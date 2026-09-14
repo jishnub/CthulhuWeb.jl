@@ -225,7 +225,13 @@ regions that hold something typeable at all, since a literal carries no type
 whether it runs or not.
 """
 const DEAD_KINDS = (K"call", K"dotcall", K"block", K"if", K"elseif", K"?", K"||",
-                    K"&&", K".", K"return", K"for", K"while")
+                    K"&&", K".", K"return", K"for", K"while",
+                    # Statements after an unconditional `return` in a taken arm:
+                    # `bc′ = preprocess(nothing, bc)` and `@inbounds val = bc′[I]`
+                    # in `copy(::Broadcasted)` once `isconcretetype(ElType)` is
+                    # `Core.Const(true)`. A live assignment always types its
+                    # right-hand side or its target.
+                    K"=", K"op=", K"macrocall")
 
 function is_dead_region(node)
     kind(node) in DEAD_KINDS || return false
@@ -1048,6 +1054,8 @@ function slot_types(result)
     for (nm, t) in zip(src.slotnames, types)
         s = string(nm)
         (isempty(s) || startswith(s, '#')) && continue
+        # never assigned on a reachable path: no read can have this type
+        t === Union{} && continue
         prev = get(out, s, missing)
         prev === missing ? (out[s] = t) : prev === t || (out[s] = nothing)
     end
