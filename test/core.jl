@@ -13,7 +13,7 @@ using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ans
                   callee_index, callee_matches, callee_value, callsite_callee,
                   constructed_type, is_name_resolution, is_synthetic_construct,
                   EXPORT_VERSION, session_document, session_text, load_session,
-                  branch_resolved, collect_unverified!, conditional_arms,
+                  branch_resolved, collect_names!, collect_unverified!, conditional_arms,
                   get_typed_sourcetext, is_dead_region,
                   has_call, has_typeable, names_in_source,
                   names_this_callsite, nothing_mapped,
@@ -193,8 +193,18 @@ terncaller(v) = ternbody(v, false)
 ternlive(n::Int, T) = isodd(n) ? -one(T) : one(T)
 ternlivecaller(n::Int) = ternlive(n, Float64)
 
+# ...and a ternary whose test folds to `false` while its TAKEN arm is a bare
+# variable that carries no type in that position. This is
+# `broadcast_preserving_zero_d`: neither arm can vouch for the other, so the
+# test's own value has to.
+function ternzero(x)
+    r = x .+ 1
+    return length(axes(r)) == 0 ? fill!(similar(r), 0.0) : r
+end
+
 # ...but here the whole conditional folds to a constant, so NO arm carries types,
-# the arm that runs included. Nothing can be said about which way it went.
+# the arm that runs included. Only the test's own `Core.Const(true)` says which
+# way it went.
 function branchpick(v::Vector{Float64})
     tag = if eltype(v) === Float64
         :f64
@@ -749,15 +759,18 @@ end
     # as is the code after the conditional
     @test !occursin("return x", faded)
 
-    # A conditional that folds WHOLE says nothing about which arm ran: no arm
-    # carries types, so greying the untaken ones would grey the taken one too.
+    # A conditional that folds WHOLE: no arm carries types, so the arms say
+    # nothing about which one ran and a sibling check alone must stay silent.
+    # The test's own `Core.Const(true)` is what decides it -- and decides it for
+    # the untaken chain only, never the taken arm.
     bmi = find_method_instance(provider, branchpick, Tuple{Vector{Float64}})
     b = Session(provider, bmi; config=cfg)
     bhtml = source_html(b, b.nodes[ROOT_ID], cfg)
     @test bhtml !== nothing
     bfaded = join(dead_regions(bhtml), "\n")
-    @test !occursin(":f64", bfaded)
-    @test !occursin(":f32", bfaded)     # ...and so neither is claimed dead
+    @test !occursin(":f64", bfaded)     # the arm that runs is never claimed dead
+    @test occursin(":f32", bfaded)      # the chain after it was compiled out
+    @test occursin(":other", bfaded)
 
     # A literal carries no type whether it runs or not, so `return true` on the
     # taken path is untyped in exactly the way an unreachable statement is.
@@ -1331,7 +1344,7 @@ end
     ms2 = Session(provider, mmi2; config=cfg)
     @test source_html(ms2, ms2.nodes[ROOT_ID], cfg) !== nothing
 end
-@testset "a no-else if whose test folded to false is greyed" begin
+@testset "a test that folded to a value greys the untaken arm on its own" begin
     cfg = headless_config(CONFIG; view=:source)
     nmi = find_method_instance(provider, noelse, Tuple{Int})
     s = Session(provider, nmi; config=cfg)
@@ -1341,6 +1354,35 @@ end
     @test any(r -> occursin("x isa Function", r), dead)     # the short-circuited operand
     @test !any(r -> occursin("x + 1", r), dead)             # the fall-through stays live
     @test !any(r -> occursin("x === identity", r), dead)    # the test ran
+
+    # Same proof for a ternary whose taken arm carries no type of its own.
+    zmi = find_method_instance(provider, ternzero, Tuple{Matrix{Float64}})
+    z = Session(provider, zmi; config=cfg)
+    zdead = dead_regions(source_html(z, z.nodes[ROOT_ID], cfg))
+    @test any(r -> occursin("fill!(similar(r), 0.0)", r), zdead)
+    @test !any(r -> occursin("length(axes(r)) == 0", r), zdead)
+    @test length(zdead) == 1                                # `r` is not greyed
+end
+
+@testset "a variable read with no type of its own reports its slot's" begin
+    cfg = headless_config(CONFIG; view=:source)
+    zmi = find_method_instance(provider, ternzero, Tuple{Matrix{Float64}})
+    z = Session(provider, zmi; config=cfg)
+    html = source_html(z, z.nodes[ROOT_ID], cfg)
+    # the `r` in the taken arm sits in a `return` TypedSyntax does not map
+    @test occursin(r"<span class=\"s s-stable\" data-type=\"::Matrix\{Float64\}   \(variable\)\">r</span>", html)
+    # ...but the `r` on the line above has its own type and keeps it
+    @test occursin(r"<span class=\"s s-stable\" data-type=\"::Matrix\{Float64\}\">r</span>", html)
+    # nothing inside the compiled-out arm gets one
+    @test !occursin(r"s-dead(?:(?!</span>).)*\(variable\)"s, html)
+
+    # names are not variables: a field, a keyword, a quoted symbol
+    ps(t) = JuliaSyntax.parsestmt(JuliaSyntax.SyntaxNode, t)
+    names(t) = Set(String(t[a:b]) for (a, b) in collect_names!(Set{Tuple{Int,Int}}(), ps(t)))
+    @test names("bc.args[1]") == Set(["args"])
+    @test names("f(x; kw=r)") == Set(["kw"])
+    @test names("g(:r, r)") == Set(["r"])          # the quoted one only
+    @test isempty(names("r = x .+ 1"))
 end
 
 @testset "code compiled out is greyed, not silently normal" begin

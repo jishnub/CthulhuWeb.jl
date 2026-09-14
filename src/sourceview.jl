@@ -378,25 +378,29 @@ method does nothing. That is the same mistake as greying `_chkstride1`, one leve
 down. The parent kind matters too: in `tag = if ...` the typed `tag` is the
 folded *result*, not evidence that any arm ran.
 
-An `if` with no `else` has a second way to be resolved: its test folded to
-`false`. Then its one arm was not taken and no arm can be live to prove it -- the
-live sibling is the fall-through. `bc.f === identity && bc.args isa Tuple{...}`
-in `copyto!(dest, bc::Broadcasted{Nothing})` is `Core.Const(false)` on the
-first operand, and the whole `if` body was rendered at full strength.
+A test that folded to a known value names the untaken arm outright, and that is
+the only proof there is in two shapes. An `if` with no `else`: its one arm was
+not taken and the live sibling is the fall-through -- `bc.f === identity &&
+bc.args isa Tuple{...}` in `copyto!(dest, bc::Broadcasted{Nothing})` is
+`Core.Const(false)` on the first operand, and the whole body rendered at full
+strength. And a `?` whose taken arm is a bare variable that carries no type in
+that position: `length(axes(bc)) == 0 ? fill!(similar(bc, typeof(r)), r) : r` in
+`broadcast_preserving_zero_d` has `r` untyped there, so neither arm could vouch
+for the other.
 """
 function collect_dead!(d::Set{Tuple{Int,Int}}, node)
     kids = children(node)
     kids === nothing && return d
     k = kind(node)
     live = if k in CHOICE_PARENTS
-        branch_resolved(node) &&
-            (any(arm_taken, conditional_arms(node)) ||
-             (length(kids) == 2 && test_is_false(kids[1])))
+        branch_resolved(node) && any(arm_taken, conditional_arms(node))
     else
         k in REGION_PARENTS && any(has_typed_descendant, kids)
     end
-    for c in kids
-        if live && is_dead_region(c)
+    v = k in CHOICE_PARENTS ? test_value(kids[1]) : nothing
+    for (i, c) in enumerate(kids)
+        untaken = (i == 2 && v === false) || (i == 3 && v === true)
+        if (live && is_dead_region(c)) || (untaken && !has_typed_descendant(c))
             push!(d, (first_byte(c), last_byte(c)))
         else
             collect_dead!(d, c)
@@ -406,22 +410,28 @@ function collect_dead!(d::Set{Tuple{Int,Int}}, node)
 end
 
 """
-Did this test fold to `false`?
+What a test folded to, if inference decided it: `true`, `false`, or `nothing`.
 
-`&&` carries no type of its own -- it lowers to a branch, not a value -- so read
-its operands: one that is `Core.Const(false)` decides it, whether the rest were
-compiled out after it or ran before it. `||` is false only if every operand is.
+`&&` and `||` carry no type of their own -- they lower to branches, not values --
+so read the operands. One `Core.Const(false)` decides an `&&` whether the rest
+were compiled out after it or ran before it; one `Core.Const(true)` decides an
+`||` the same way; every operand known decides either.
 """
-function test_is_false(node)
+function test_value(node)
     t = node.typ
-    t isa Core.Const && return t.val === false
+    t isa Core.Const && return t.val isa Bool ? t.val : nothing
     kids = children(node)
-    (t !== nothing || kids === nothing) && return false
+    (t !== nothing || kids === nothing) && return nothing
     k = kind(node)
-    k === K"&&" && return any(test_is_false, kids)
-    k === K"||" && return all(test_is_false, kids)
-    k === K"parens" && return length(kids) == 1 && test_is_false(kids[1])
-    return false
+    if k === K"&&" || k === K"||"
+        short = k === K"||"          # the value that short-circuits
+        vs = map(test_value, kids)
+        any(x -> x === short, vs) && return short
+        all(x -> x === !short, vs) && return !short
+        return nothing
+    end
+    k === K"parens" && length(kids) == 1 && return test_value(kids[1])
+    return nothing
 end
 
 function has_typed_descendant(node)
@@ -998,6 +1008,8 @@ struct RenderCtx
     unverified::Set{Tuple{Int,Int}}
     unowned::Set{Tuple{Int,Int}}
     sparams::Dict{String,Any}
+    slots::Dict{String,Any}          # variable name -> its slot type, see `slot_types`
+    names::Set{Tuple{Int,Int}}       # identifiers that are names, not variables
     classmap::Vector{UInt8}
     offset::Int
     idxend::Int
@@ -1007,9 +1019,60 @@ struct RenderCtx
     spans::Union{Nothing,Vector{NamedTuple}}
 end
 
-RenderCtx(src, callsites, dead, unverified, unowned, sparams, classmap, offset, idxend) =
-    RenderCtx(src, callsites, dead, unverified, unowned, sparams, classmap, offset,
-              idxend, nothing)
+RenderCtx(src, callsites, dead, unverified, unowned, sparams, slots, names, classmap,
+          offset, idxend) =
+    RenderCtx(src, callsites, dead, unverified, unowned, sparams, slots, names, classmap,
+              offset, idxend, nothing)
+
+"""
+Each variable's type across the whole method, by name -- what `code_warntype`
+lists under `Variables`.
+
+A variable read that TypedSyntax could not map to a statement carries no type of
+its own: the `r` in `... ? fill!(...) : r` of `broadcast_preserving_zero_d` sits
+in a `return` shared by both arms, and came back untyped while the `r` a line
+above read `::Matrix{Float64}`. The slot still has a type, and it holds at every
+occurrence, so it is the fallback for an untyped one. Coarser than the
+per-position type where inference narrowed a `Union` in one branch -- which is
+why it is only a fallback -- but never wrong.
+
+Two slots sharing a name (a variable shadowed in an inner scope) with different
+types are dropped rather than guessed.
+"""
+function slot_types(result)
+    out = Dict{String,Any}()
+    src = result.src
+    isa(src, Core.CodeInfo) || return out
+    types = hasproperty(result, :slottypes) ? result.slottypes : src.slottypes
+    types === nothing && return out
+    for (nm, t) in zip(src.slotnames, types)
+        s = string(nm)
+        (isempty(s) || startswith(s, '#')) && continue
+        prev = get(out, s, missing)
+        prev === missing ? (out[s] = t) : prev === t || (out[s] = nothing)
+    end
+    filter!(p -> p.second !== nothing, out)
+    return out
+end
+
+"""
+Identifiers that spell a *name* rather than read a variable, so the slot
+fallback must not type them: `args` in `bc.args`, `kw` in `f(x; kw=1)`, `:sym`.
+"""
+function collect_names!(d::Set{Tuple{Int,Int}}, node)
+    kids = children(node)
+    kids === nothing && return d
+    k = kind(node)
+    rng(n) = (first_byte(n), last_byte(n))
+    k === K"." && length(kids) == 2 && push!(d, rng(kids[2]))
+    k === K"quote" && foreach(c -> push!(d, rng(c)), kids)
+    k === K"parameters" && for c in kids
+        ck = children(c)
+        kind(c) === K"=" && ck !== nothing && !isempty(ck) && push!(d, rng(ck[1]))
+    end
+    foreach(c -> collect_names!(d, c), kids)
+    return d
+end
 
 """
 Spans one source range shares with several IR statements, so the type the
@@ -1252,7 +1315,8 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
     inlined && distrust_body!(unverified, body, callsite_map)
     ctx = RenderCtx(src, callsite_map, deadspans, unverified,
                     collect_unowned!(unowned, tsn),
-                    sparams, token_classmap(src, startb, idxend), startb, idxend,
+                    sparams, slot_types(result), collect_names!(Set{Tuple{Int,Int}}(), tsn),
+                    token_classmap(src, startb, idxend), startb, idxend,
                     report === nothing ? nothing : NamedTuple[])
     io = IOBuffer()
     walk_source(io, tsn, startb, ctx)
@@ -1429,6 +1493,19 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
         end
     end
 
+    # A variable read with no type of its own reports its slot's type -- see
+    # `slot_types`. Not for a callee, a field or keyword name, or anything inside
+    # a compiled-out region, where no read happens.
+    isvar = false
+    if typ === nothing && !iscallee && kind(node) === K"Identifier" &&
+       !((fb, lb) in ctx.names) && !any(((a, b),) -> a <= fb && lb <= b, ctx.dead)
+        val = get(ctx.slots, String(src[fb:lb]), nothing)
+        if val !== nothing
+            typ = val
+            isvar = true
+        end
+    end
+
     if (fb, lb) in ctx.dead
         # Grey the whole subtree, and say why on hover -- an unexplained grey
         # block reads as a rendering failure.
@@ -1483,10 +1560,13 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
     runtime && push!(classes, "s-runtime")
     nodeid != 0 && push!(classes, "s-call")
 
-    record_span!(ctx, fb, lb, typ, nodeid, classes, issparam)
+    # the export says "(variable)" where the page does
+    record_span!(ctx, fb, lb, isvar ? string(typ) * "   (variable)" : typ,
+                 nodeid, classes, issparam)
     print(io, "<span class=\"", join(classes, ' '), "\"")
     if typ !== nothing
         label = issparam ? "$(String(src[fb:lb])) = $(typ)   (static parameter)" :
+                isvar    ? "::" * string(typ) * "   (variable)" :
                            "::" * string(typ)
         print(io, " data-type=\"", html_escape(label), "\"")
     end
