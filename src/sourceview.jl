@@ -1496,14 +1496,9 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
     # A variable read with no type of its own reports its slot's type -- see
     # `slot_types`. Not for a callee, a field or keyword name, or anything inside
     # a compiled-out region, where no read happens.
-    isvar = false
     if typ === nothing && !iscallee && kind(node) === K"Identifier" &&
        !((fb, lb) in ctx.names) && !any(((a, b),) -> a <= fb && lb <= b, ctx.dead)
-        val = get(ctx.slots, String(src[fb:lb]), nothing)
-        if val !== nothing
-            typ = val
-            isvar = true
-        end
+        typ = get(ctx.slots, String(src[fb:lb]), nothing)
     end
 
     if (fb, lb) in ctx.dead
@@ -1560,13 +1555,10 @@ function open_span(io::IO, node, fb::Int, lb::Int, ctx::RenderCtx, iscallee::Boo
     runtime && push!(classes, "s-runtime")
     nodeid != 0 && push!(classes, "s-call")
 
-    # the export says "(variable)" where the page does
-    record_span!(ctx, fb, lb, isvar ? string(typ) * "   (variable)" : typ,
-                 nodeid, classes, issparam)
+    record_span!(ctx, fb, lb, typ, nodeid, classes, issparam)
     print(io, "<span class=\"", join(classes, ' '), "\"")
     if typ !== nothing
         label = issparam ? "$(String(src[fb:lb])) = $(typ)   (static parameter)" :
-                isvar    ? "::" * string(typ) * "   (variable)" :
                            "::" * string(typ)
         print(io, " data-type=\"", html_escape(label), "\"")
     end

@@ -1377,12 +1377,13 @@ end
     zmi = find_method_instance(provider, ternzero, Tuple{Matrix{Float64}})
     z = Session(provider, zmi; config=cfg)
     html = source_html(z, z.nodes[ROOT_ID], cfg)
-    # the `r` in the taken arm sits in a `return` TypedSyntax does not map
-    @test occursin(r"<span class=\"s s-stable\" data-type=\"::Matrix\{Float64\}   \(variable\)\">r</span>", html)
-    # ...but the `r` on the line above has its own type and keeps it
-    @test occursin(r"<span class=\"s s-stable\" data-type=\"::Matrix\{Float64\}\">r</span>", html)
+    # the `r` in the taken arm sits in a `return` TypedSyntax does not map, and
+    # reads exactly like the `r = ...` a line above that has its own type
+    rspans = collect(eachmatch(r"<span class=\"s s-stable\" data-type=\"::Matrix\{Float64\}\">r</span>", html))
+    @test length(rspans) >= 2
+    @test last(rspans).offset > last(findlast("<span class=\"s s-dead\"", html))
     # nothing inside the compiled-out arm gets one
-    @test !occursin(r"s-dead(?:(?!</span>).)*\(variable\)"s, html)
+    @test !occursin(r"s-dead[^>]*>(?:(?!</span>).)*data-type=\"::"s, html)
 
     # names are not variables: a field, a keyword, a quoted symbol
     ps(t) = JuliaSyntax.parsestmt(JuliaSyntax.SyntaxNode, t)
