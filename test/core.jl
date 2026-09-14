@@ -1743,8 +1743,17 @@ end
 end
 
 @testset "presentation mechanisms that silently regressed before" begin
-    css = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "style.css"), String)
-    js  = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "app.js"), String)
+    css  = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "style.css"), String)
+    js   = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "app.js"), String)
+    page = read(joinpath(pkgdir(CthulhuWeb), "src", "assets", "index.html"), String)
+
+    # A lost connection is announced in its own banner. It used to go through
+    # `#status`, which the busy indicator clears on the next click, so a tab
+    # whose Julia session had died showed nothing.
+    @test occursin("id=\"conn\"", page)
+    @test occursin(r"function scheduleReconnect\(\)(?:(?!^}$).)*conn\("ms, js)
+    @test !occursin(r"function refreshBusy\(\)(?:(?!^}$).)*#conn"ms, js)
+    @test occursin("Start it again with descend_web", js)
 
     # Tooltips were once a CSS ::after using `:hover:not(:has(...))`. That is
     # clipped by .srcwrap's scroll container (invisible on line 1) and the whole

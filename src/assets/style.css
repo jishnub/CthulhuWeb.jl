@@ -41,6 +41,12 @@ header h1 { font-size: 14px; margin: 0; letter-spacing: .08em; text-transform: u
 .sig { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .spacer { flex: 1; }
 .status { color: var(--accent); min-width: 90px; text-align: right; }
+/* The Julia session went away: said where it cannot be missed, and separately
+   from the busy indicator so nothing clears it. */
+.conn {
+  padding: 6px 14px; border-bottom: 1px solid var(--line);
+  border-left: 4px solid var(--yellow); background: var(--panel); color: var(--yellow);
+}
 
 #toolbar {
   display: flex; flex-wrap: wrap; gap: 10px;

@@ -14,12 +14,16 @@ const pending = new Map();   // req -> resolve
 
 const $ = (s) => document.querySelector(s);
 const status = (t) => { $("#status").textContent = t || ""; };
+// Connection state has its own banner. It used to share `#status` with the busy
+// indicator, and `refreshBusy` cleared it on the next click -- so a tab whose
+// Julia session had gone away showed nothing at all.
+const conn = (t) => { const el = $("#conn"); el.textContent = t || ""; el.hidden = !t; };
 
 // ---------------------------------------------------------------- transport
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/`);
-  ws.onopen = () => { retry = 0; status(""); };
+  ws.onopen = () => { retry = 0; conn(""); status(""); };
   ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
   ws.onclose = () => scheduleReconnect();
   // onclose always follows onerror, so let one place own the retry
@@ -38,8 +42,12 @@ const RETRY_MS = [200, 400, 800, 1600, 3000];
 let retryTimer = null;
 function scheduleReconnect() {
   if (retryTimer) return;
-  if (retry >= 40) { status("disconnected — reload to reconnect"); return; }
-  status("reconnecting…");
+  if (retry >= 40) {
+    conn("Connection to the Julia session lost. Is the server still running? " +
+         "Start it again with descend_web, then reload this tab.");
+    return;
+  }
+  conn("Connection to the Julia session lost — reconnecting…");
   const delay = RETRY_MS[Math.min(retry, RETRY_MS.length - 1)];
   retry++;
   retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
