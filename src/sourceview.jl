@@ -192,6 +192,33 @@ function callee_value(node, src = nothing, sparams = nothing)
     return get(sparams, String(src[first_byte(c):last_byte(c)]), nothing)
 end
 
+"""
+Is this callee spelled `name` in the source? The fallback where inference left
+the callee position untyped and there is no identity to match: weaker, so
+`place_by_callee!` still demands the pairing be unique both ways.
+"""
+function callee_matches(n::Node, name::AbstractString)
+    ctor = constructed_type(n)
+    names = ctor === nothing ? [n.label.name] : ctor_names(ctor)
+    return any(x -> x == name || endswith(x, "." * name), names)
+end
+
+"""
+The call enclosing a macro call, if that call spells `name` as its callee.
+
+A callsite handed a `macrocall` as its span was attached by the macro's
+expansion, not by anything the source names: `maximum(abs, @view
+cf.coefficients[bs:end])` in ApproxFunBase's `_default_Fun` came back with
+`maximum` on the `@view`. The `maximum(...)` around it is the span.
+"""
+function enclosing_call_named(sn, name::AbstractString, src)
+    p = sn.parent
+    (p === nothing || !(kind(p) === K"call" || kind(p) === K"dotcall")) && return nothing
+    nm = callee_name(p, src)
+    short = replace(name, r"^.*\." => "")
+    return nm == short ? p : nothing
+end
+
 "Does this candidate dispatch on `v`, the function the callee position resolved to?"
 function callee_matches(n::Node, @nospecialize(v))
     ct = callsite_callee(n)
@@ -393,8 +420,23 @@ strength. And a `?` whose taken arm is a bare variable that carries no type in
 that position: `length(axes(bc)) == 0 ? fill!(similar(bc, typeof(r)), r) : r` in
 `broadcast_preserving_zero_d` has `r` untyped there, so neither arm could vouch
 for the other.
+
+**A sequence is dead only past its last live member.** The statements of a
+block and the operands of a short circuit run in order, so reaching a later one
+means every earlier one ran, typed or not. `ncoefficients(cf) > 8 && maximum(...)
+< 10tol*maxabsc && all(...)` in ApproxFunBase's `_default_Fun` came back with the
+first operand untyped -- Cthulhu could not place its two callsites -- and it was
+greyed as short-circuited while the operands it guards were typed. An untyped
+member before a typed one is unmapped, not unreachable.
+
+**A region a callsite is spelled in ran.** `ran(c)` is the caller's veto: where a
+callsite of this method has no source node and its callee is spelled by an
+unmapped call inside `c` and nowhere else, the call happened -- a callsite only
+exists for code inference reached -- and the missing types are the mapping's.
+The last operand of a macro's line, `all(k -> ..., 1:length(r))`, was greyed as
+short-circuited that way.
 """
-function collect_dead!(d::Set{Tuple{Int,Int}}, node)
+function collect_dead!(d::Set{Tuple{Int,Int}}, node; ran = n -> false)
     kids = children(node)
     kids === nothing && return d
     k = kind(node)
@@ -404,15 +446,35 @@ function collect_dead!(d::Set{Tuple{Int,Int}}, node)
         k in REGION_PARENTS && any(has_typed_descendant, kids)
     end
     v = k in CHOICE_PARENTS ? test_value(kids[1]) : nothing
+    lasttyped = k in REGION_PARENTS ? something(findlast(has_typed_descendant, kids), 0) : 0
     for (i, c) in enumerate(kids)
         untaken = (i == 2 && v === false) || (i == 3 && v === true)
-        if (live && is_dead_region(c)) || (untaken && !has_typed_descendant(c))
+        dead = (live && i > lasttyped && is_dead_region(c)) ||
+               (untaken && !has_typed_descendant(c))
+        if dead && !ran(c)
             push!(d, (first_byte(c), last_byte(c)))
         else
-            collect_dead!(d, c)
+            collect_dead!(d, c; ran)
         end
     end
     return d
+end
+
+"""
+How many times each callee name is spelled by an unmapped call under `node`.
+Closures are left out: their calls are another method's.
+"""
+function spelled_callees!(counts::Dict{String,Int}, node, callsite_map, src)
+    k = kind(node)
+    (k === K"->" || k === K"function" || k === K"generator") && return counts
+    if (k === K"call" || k === K"dotcall") &&
+       !haskey(callsite_map, (first_byte(node), last_byte(node)))
+        nm = callee_name(node, src)
+        nm === nothing || (counts[nm] = get(counts, nm, 0) + 1)
+    end
+    kids = children(node)
+    kids === nothing || foreach(c -> spelled_callees!(counts, c, callsite_map, src), kids)
+    return counts
 end
 
 """
@@ -693,6 +755,10 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
         # `dead` holds outermost regions, so this prunes the whole subtree
         rng(nd) in dead && return
         k = kind(nd)
+        # A closure's body is another method's: the `length(cf.coefficients)`
+        # inside `all(k -> ..., 1:length(r))` is not where this method's
+        # `length` callsite goes, and offering it only ties the one that is.
+        (k === K"->" || k === K"function" || k === K"generator") && return
         if k === K"call" || k === K"dotcall"
             # A callee is a name being resolved, not a value being read out of
             # something. `LAPACK.gesdd!(x)` does lower to a
@@ -705,6 +771,10 @@ function place_by_callee!(callsite_map, s::Session, unplaced::Vector{Int}, tsn, 
             ck === nothing || isempty(ck) || push!(calleespans, rng(ck[1]))
             if unmapped(nd)
                 v = callee_value(nd, src, sparams)
+                # No identity when the callee position itself went untyped --
+                # every call on a macro's line, in `_default_Fun`. The spelling
+                # is what is left, and uniqueness both ways is what makes it safe.
+                v === nothing && (v = callee_name(nd, src))
                 v === nothing || push!(nodes, (v, nd))
             end
         end
@@ -1226,6 +1296,8 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
                 kn = s.nodes[kids[i]]
                 is_name_resolution(kn) && continue
                 is_synthetic_construct(kn, kind(sn)) && continue
+                kind(sn) === K"macrocall" &&
+                    (sn = something(enclosing_call_named(sn, kn.label.name, sourcefile(tsn)), sn))
                 key = (first_byte(sn), last_byte(sn))
                 get!(spannode, key, sn)
                 push!(get!(cands, key, Int[]), kids[i])
@@ -1302,7 +1374,16 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
     deadspans = Set{Tuple{Int,Int}}()
     unmapped = !truncated && nothing_mapped(body) && body !== nothing && has_call(body)
     inlined = !truncated && !unmapped && result.optimized && body !== nothing
-    truncated || unmapped || inlined || collect_dead!(deadspans, body)
+    # A callsite with no source node whose callee is spelled by an unmapped call
+    # in exactly one place: that place ran. See `collect_dead!`.
+    ran = let names = Set(replace(s.nodes[k].label.name, r"^.*\." => "") for k in unplaced),
+              src = sourcefile(tsn),
+              total = body === nothing ? Dict{String,Int}() :
+                      spelled_callees!(Dict{String,Int}(), body, callsite_map, src)
+        c -> any(((nm, n),) -> nm in names && n == get(total, nm, 0),
+                 spelled_callees!(Dict{String,Int}(), c, callsite_map, src))
+    end
+    truncated || unmapped || inlined || collect_dead!(deadspans, body; ran)
 
     # Body only: the method's own signature is a `call` node whose callee is the
     # method itself, and it would tie with a recursive call in the body.

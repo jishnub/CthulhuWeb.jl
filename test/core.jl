@@ -14,8 +14,9 @@ using CthulhuWeb: ESC, NodeId, body_label, is_body_method, ROOT_ID, Session, ans
                   constructed_type, is_name_resolution, is_synthetic_construct,
                   EXPORT_VERSION, session_document, session_text, load_session,
                   branch_resolved, collect_names!, collect_unverified!, conditional_arms,
+                  enclosing_call_named,
                   get_typed_sourcetext, is_dead_region,
-                  has_call, has_typeable, names_in_source,
+                  has_call, has_typeable, has_typed_descendant, names_in_source,
                   names_this_callsite, nothing_mapped,
                   source_tokens,
                   unique_callsites,
@@ -27,6 +28,27 @@ rec(n) = n <= 1 ? 1 : n * rec(n - 1)
 # No `else`, so no arm can be live to prove the branch was decided; the test
 # folding to `false` is the proof, through an `&&` that carries no type itself.
 noelse(x) = (if x === identity && x isa Function; return abs(x); end; x + 1)
+
+# A macro on the line leaves every call on it unmapped, and the callee positions
+# untyped, so nothing can be placed by identity. The shape of ApproxFunBase's
+# `_default_Fun`, closure included: its `length(cf.coefficients)` belongs to the
+# closure, and must not tie with the `length(r)` that is this method's.
+struct Coefs; coefficients::Vector{Float64}; end
+ncoefs(c::Coefs) = length(c.coefficients)
+function macroline(cf::Coefs, bs, tol, r, fr)
+    maxabsc = maximum(abs, cf.coefficients)
+    if ncoefs(cf) > 8 && maximum(abs, @view cf.coefficients[bs:end]) < 10tol*maxabsc &&
+            all(k->abs(cf.coefficients[k]-fr[k])<tol*length(cf.coefficients), 1:length(r))
+        return maxabsc
+    end
+    return 0.0
+end
+
+# Two identical `length(v) > 8` on one line are ambiguous to `map_ssas_to_source`,
+# so the first operand comes back untyped next to a typed one. It ran -- nothing
+# after it could have otherwise -- and must not be greyed as short-circuited.
+# This is `ncoefficients(cf) > 8 && ...` in ApproxFunBase's `_default_Fun`.
+firstuntyped(v) = length(v) > 8 && length(v) > 8 && sum(v) > 0
 
 # Everything after a taken arm that returns is unreachable -- the shape of
 # `copy(::Broadcasted)` once `isconcretetype(ElType)` is known. Assignments and
@@ -333,6 +355,21 @@ function dead_regions(html::AbstractString)
         end
     end
     return out
+end
+
+"Plain text of the click target for node `id`, or `nothing` if it has none."
+function click_text(html::AbstractString, id::Int)
+    m = match(Regex("<span class=\"[^\"]*s-call[^\"]*\"[^>]*data-node-id=\"$(id)\"[^>]*>"), html)
+    m === nothing && return nothing
+    depth, buf = 1, IOBuffer()
+    for t in eachmatch(r"<span[^>]*>|</span>|[^<]+", html[m.offset + length(m.match):end])
+        s = t.match
+        if startswith(s, "<span"); depth += 1
+        elseif startswith(s, "</"); depth -= 1; depth == 0 && break
+        else print(buf, s)
+        end
+    end
+    return String(take!(buf))
 end
 
 provider = AbstractProvider(Base.Compiler.NativeInterpreter())
@@ -1169,22 +1206,26 @@ end
     # the mapping -- and so does the method's return type
     @test occursin("data-type=\"::Core.Const(3)\"", html)
     @test occursin("data-type=\"::Float64\"", html)
-    # ...but nothing in the body does
+    # ...but nothing in the body is annotated FROM THE MAPPING. In particular not
+    # the two that were wrong: `string`'s callsite had been attached to the `+`
+    # (reporting `::String` for an `Int64` addition) and `length`'s to the `*`.
     code = replace(html, r"^.*<pre class=\"code src\">"s => "", r"</pre></div>.*$"s => "")
     body = code[something(findfirst("\n", code)).start:end]   # past the signature line
-    @test !occursin("data-type", body)
-    # in particular not the two that were wrong: `string`'s callsite had been
-    # attached to the `+` (reporting `::String` for an `Int64` addition) and
-    # `length`'s to the `*`
     @test !occursin("::String", code)
-    @test !occursin("data-node-id", body)
+    # What the body may carry is a callsite placed where the source spells its
+    # callee -- `length` on `length(string(n))`, with the callsite's own type --
+    # and every click target in it has to be of that kind.
+    for m in eachmatch(r"data-node-id=\"(\d+)\"", body)
+        id = parse(Int, m.captures[1])
+        @test startswith(click_text(html, id), s.nodes[id].label.name * "(")
+    end
+    nkids = expand!(s, node.id; optimize=false)
+    li = findfirst(k -> s.nodes[k].label.name == "length", nkids)
+    @test li !== nothing && click_text(html, nkids[li]) == "length(string(n))"
+    @test occursin("data-type=\"::Int64\" data-node-id=\"$(nkids[li])\"", html)
     # and no dead-code marking: with a line-based mapping, an untyped node is not
     # evidence of anything
     @test !occursin("s-dead", html)
-
-    # the calls are not lost, only honestly relocated
-    @test occursin("unlocated", html)
-    @test occursin("length(::String)", html)
 
     # a placement the source DOES name survives the same gate
     @test names_this_callsite(s, kids[i], JuliaSyntax.parsestmt(JuliaSyntax.SyntaxNode,
@@ -1384,6 +1425,49 @@ end
     @test any(r -> occursin("fill!(similar(r), 0.0)", r), zdead)
     @test !any(r -> occursin("length(axes(r)) == 0", r), zdead)
     @test length(zdead) == 1                                # `r` is not greyed
+end
+
+@testset "calls on a macro's line are placed by their spelling" begin
+    cfg = headless_config(CONFIG; view=:source)
+    mmi = find_method_instance(provider, macroline,
+                               Tuple{Coefs,Int,Float64,Vector{Float64},Vector{Float64}})
+    m = Session(provider, mmi; config=cfg)
+    kids = expand!(m, ROOT_ID; optimize=false)
+    html = source_html(m, m.nodes[ROOT_ID], cfg)
+    byname(nm) = [k for k in kids if m.nodes[k].label.name == nm]
+    # the `all(...)` and the `length(r)` are this method's, and clickable
+    @test click_text(html, only(byname("all"))) !== nothing
+    @test startswith(click_text(html, only(byname("all"))), "all(")
+    lens = byname("length")
+    @test length(lens) == 1                          # the closure's is not ours
+    @test click_text(html, only(lens)) == "length(r)"
+    # `view` is what `@view` expands to; the source never spells it, so it has
+    # no click target -- and nothing on the line is greyed: the calls ran, the
+    # mapping is what failed
+    @test click_text(html, only(byname("view"))) === nothing
+    @test isempty(dead_regions(html))
+
+    # A callsite attached to a macro call belongs to the call around it, when
+    # that call spells the callee.
+    ps(t) = JuliaSyntax.parsestmt(JuliaSyntax.SyntaxNode, t)
+    call = ps("maximum(abs, @view x[1:2])")
+    mc = only(nodes_of_kind(call, K"macrocall"))
+    @test enclosing_call_named(mc, "maximum", JuliaSyntax.sourcefile(call)) === call
+    @test enclosing_call_named(mc, "Base.maximum", JuliaSyntax.sourcefile(call)) === call
+    @test enclosing_call_named(mc, "sum", JuliaSyntax.sourcefile(call)) === nothing
+end
+
+@testset "an untyped operand before a typed one ran, and is not greyed" begin
+    cfg = headless_config(CONFIG; view=:source)
+    fmi = find_method_instance(provider, firstuntyped, Tuple{Vector{Float64}})
+    f = Session(provider, fmi; config=cfg)
+    fres = lookup_cached!(f, f.nodes[ROOT_ID], false)
+    ftsn = first(get_typed_sourcetext(fmi, fres.src, fres.rt))
+    outer = first(sort(nodes_of_kind(ftsn, K"&&"); by = first_byte))
+    @test children(outer)[1].typ === nothing              # the shape the bug needs...
+    @test has_typed_descendant(children(outer)[2])        # ...a typed operand after it
+    html = source_html(f, f.nodes[ROOT_ID], cfg)
+    @test isempty(dead_regions(html))
 end
 
 @testset "code after a taken arm's return is greyed, assignments included" begin
