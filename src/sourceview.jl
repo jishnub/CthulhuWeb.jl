@@ -1299,6 +1299,17 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
     # note needs the real child list regardless of whether annotation succeeds.
     kids = expand!(s, node.id; optimize=false)
     sparams = Dict{String,Any}(static_params(node.mi))
+    # What a name in callee position resolves to when its own node is untyped:
+    # a static parameter, or a variable whose slot holds a known function --
+    # `adj = dualadjoint(dest); adj(copyto!(...; kwds...))` in ArrayLayouts'
+    # `copyto!(::AbstractArray, ::Rdiv)` has `adj::Core.Const(adjoint)`, and the
+    # outer call's `adj` is a read the mapping left untyped. Spelled `adj`, not
+    # `adjoint`, so the name fallback could not place it either.
+    # A function's slot is its singleton type `typeof(adjoint)`, not a `Const`.
+    callees = merge(Dict{String,Any}(k => (t isa Core.Const ? t.val : t.instance)
+                                     for (k, t) in slot_types(result)
+                                     if t isa Core.Const || (t isa DataType && Base.issingletontype(t))),
+                    sparams)
 
     callsite_map = Dict{Tuple{Int,Int},NamedTuple}()
     unplaced = Int[]
@@ -1341,13 +1352,13 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
             spantypes = span_types!(Dict{Tuple{Int,Int},String}(), tsn)
             for (key, ks) in cands
                 k = pick_callsite(s, ks, spannode[key], sourcefile(tsn),
-                                  get(spantypes, key, nothing), sparams)
+                                  get(spantypes, key, nothing), callees)
                 # An optimized result attaches callsites by line, not by
                 # provenance, so a span can be handed a call it does not name.
                 # Keep only what the source confirms; the rest fall back to the
                 # unlocated list, where they are at least honestly placed.
                 if result.optimized && !names_this_callsite(s, k, spannode[key],
-                                                            sourcefile(tsn), sparams)
+                                                            sourcefile(tsn), callees)
                     append!(unplaced, ks)
                     continue
                 end
@@ -1432,7 +1443,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
     recognised = Set{Int}()
     unplaced = try
         body === nothing ? unplaced :
-            place_by_callee!(callsite_map, s, unplaced, body, sourcefile(tsn), sparams,
+            place_by_callee!(callsite_map, s, unplaced, body, sourcefile(tsn), callees,
                              unowned, deadspans, recognised)
     catch err
         @warn "placing unlocated callsites failed" node.mi exception=(err, catch_backtrace())

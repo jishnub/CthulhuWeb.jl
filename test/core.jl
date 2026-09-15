@@ -44,6 +44,18 @@ function macroline(cf::Coefs, bs, tol, r, fr)
     return 0.0
 end
 
+# A function held in a variable: `adj = dualadjoint(dest); adj(copyto!(...;
+# kwds...))` in ArrayLayouts' `copyto!(::AbstractArray, ::Rdiv)`. The outer
+# call's callee position is a variable read the mapping left untyped, and it is
+# spelled `adj`, not `adjoint` -- so neither identity nor name could place it,
+# and the unlocated list did not know it either. Its slot is `Core.Const(adjoint)`.
+struct RD; A::Matrix{Float64}; B::Matrix{Float64}; end
+pickadj(::Matrix) = adjoint
+function rdivlike(dest::Matrix{Float64}, M::RD; kwds...)
+    adj = pickadj(dest)
+    adj(copyto!(adj(dest), adj(M.B) * adj(M.A); kwds...))
+end
+
 # A `ccall` lowers to a `cconvert`/`unsafe_convert` per argument, and the mapping
 # hands one of them to the argument-type tuple -- BandedMatrices' `gbmv!` showed
 # `::Ptr{Int64}` on `(Ref{UInt8}, Ref{BlasInt}, ...)`. A tuple performs no call.
@@ -1470,6 +1482,22 @@ end
     @test enclosing_call_named(mc, "maximum", JuliaSyntax.sourcefile(call)) === call
     @test enclosing_call_named(mc, "Base.maximum", JuliaSyntax.sourcefile(call)) === call
     @test enclosing_call_named(mc, "sum", JuliaSyntax.sourcefile(call)) === nothing
+end
+
+@testset "a call through a function-valued variable is placed by its slot" begin
+    cfg = headless_config(CONFIG; view=:source)
+    s = Session(provider, find_method_instance(provider, rdivlike, Tuple{Matrix{Float64},RD}); config=cfg)
+    top = expand!(s, ROOT_ID; optimize=false)
+    body = s.nodes[top[findfirst(k -> startswith(s.nodes[k].label.name, "var\"##rdivlike"), top)]]
+    kids = expand!(s, body.id; optimize=false)
+    html = source_html(s, body, cfg)
+    outer = only(k for k in kids if s.nodes[k].label.name == "adjoint" && s.nodes[k].label.rt == "Matrix{Float64}")
+    @test startswith(something(click_text(html, outer), ""), "adj(copyto!(")
+    # the inner three keep theirs
+    for k in kids
+        s.nodes[k].label.name == "adjoint" && k != outer || continue
+        @test startswith(something(click_text(html, k), ""), "adj(")
+    end
 end
 
 @testset "a ccall's type tuple is neither a call nor typed by one" begin
