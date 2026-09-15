@@ -1500,6 +1500,26 @@ end
     end
 end
 
+@testset "open in editor" begin
+    cfg = headless_config(CONFIG; view=:source)
+    s = Session(provider, mi; config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    @test occursin("class=\"editlink\" data-edit-id=\"$(ROOT_ID)\"", html)
+    # `InteractiveUtils.edit` calls an unknown editor as `$cmd $path`, so a
+    # stub that records its arguments stands in for one
+    mktempdir() do dir
+        log, stub = joinpath(dir, "args"), joinpath(dir, "ed.sh")
+        write(stub, "#!/bin/sh\necho \"\$@\" > '$log'\n"); chmod(stub, 0o755)
+        r = withenv("JULIA_EDITOR" => stub) do
+            CthulhuWeb.op_edit(s, ROOT_ID)
+        end
+        @test r["op"] == "edit"
+        @test r["file"] == s.nodes[ROOT_ID].label.file
+        @test timedwait(() -> isfile(log), 5.0) === :ok
+        @test strip(read(log, String)) == s.nodes[ROOT_ID].label.file
+    end
+end
+
 @testset "a ccall's type tuple is neither a call nor typed by one" begin
     cfg = headless_config(CONFIG; view=:source)
     s = Session(provider, find_method_instance(provider, ccalls, Tuple{Int,Float64}); config=cfg)

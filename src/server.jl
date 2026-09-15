@@ -170,11 +170,28 @@ function op_config(s::Session, key::String, value)
     )
 end
 
+"""
+Open the node's source in the user's editor, as Cthulhu's jump does:
+`InteractiveUtils.edit` honours `JULIA_EDITOR`. A browser click running a
+program on the host is what `headless_config` refuses for the config toggles;
+this one is explicit, and `origin_allowed` keeps it to our own page. A terminal
+editor blocks the analysis worker until it exits, as it blocks Cthulhu's REPL.
+"""
+function op_edit(s::Session, id::NodeId)
+    n = s.nodes[id]
+    n.label.file === nothing &&
+        return Dict{String,Any}("op" => "error", "msg" => "no source file for this node")
+    InteractiveUtils.edit(n.label.file, n.label.line)
+    return Dict{String,Any}("op" => "edit", "id" => id,
+                            "file" => n.label.file, "line" => n.label.line)
+end
+
 function handle(s::Session, msg)
     op = get(msg, :op, nothing)
     op == "expand" && return op_tree(s, Int(msg[:id]))
     op == "body"   && return op_body(s, Int(msg[:id]))
     op == "config" && return op_config(s, String(msg[:key]), msg[:value])
+    op == "edit"   && return op_edit(s, Int(msg[:id]))
     if op == "export"
         exp = get(msg, :expanded, nothing)
         return op_export(s, Int(get(msg, :id, ROOT_ID)),

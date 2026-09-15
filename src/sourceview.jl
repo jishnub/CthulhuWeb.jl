@@ -1468,7 +1468,10 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
     gutter = join(string.(firstline:(firstline + nlines - 1)), "\n")
 
     file = node.label.file === nothing ? "" :
-        "<div class=\"srcfile\">" * html_escape(node.label.file) * "</div>"
+        "<div class=\"srcfile\"><span class=\"path\">" * html_escape(node.label.file) *
+        ":" * string(node.label.line) * "</span>" *
+        "<button class=\"editlink\" data-edit-id=\"" * string(node.id) *
+        "\">open in editor</button></div>"
     note = truncated ? truncated_note(s, node, kids) :
            unmapped  ? unmapped_note(node) :
            inlined   ? inlined_note(node) : ""

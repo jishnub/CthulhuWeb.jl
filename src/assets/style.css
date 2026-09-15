@@ -144,7 +144,15 @@ pre.code { margin: 0; white-space: pre; overflow-x: auto; tab-size: 4; }
 
 /* ---- type-annotated source view ---- */
 .srcfile { color: var(--muted); font-size: 11px; margin-bottom: 6px;
-           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
+           display: flex; align-items: baseline; gap: 8px; }
+.srcfile .path { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                 white-space: nowrap; direction: rtl; }
+.editlink {
+  font: inherit; font-size: 11px; white-space: nowrap;
+  background: none; color: var(--accent);
+  border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; cursor: pointer;
+}
+.editlink:hover { background: var(--sel); border-color: var(--accent); }
 .srcwrap { display: flex; gap: 10px; overflow-x: auto; }
 pre.gutter {
   margin: 0; text-align: right; color: var(--muted); opacity: .55;

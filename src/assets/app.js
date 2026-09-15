@@ -374,6 +374,15 @@ const shortName = (s) => s.replace(/^MethodInstance for /, "");
 // what makes the source view the primary navigation surface rather than a readout.
 function wireSourceSpans() {
   wireTooltips();
+  // "open in editor" runs `InteractiveUtils.edit` on the host, as Cthulhu's
+  // jump does. The button reports what happened in place of its own label.
+  for (const b of document.querySelectorAll("#code .editlink")) {
+    b.onclick = async () => {
+      b.textContent = "opening…";
+      const r = await send("edit", { id: Number(b.dataset.editId) });
+      b.textContent = r.error || r.op === "error" ? (r.error || r.msg) : "open in editor";
+    };
+  }
   const spans = document.querySelectorAll("#code .s-call[data-node-id]");
   if (!spans.length) return;
   for (const el of spans) {
