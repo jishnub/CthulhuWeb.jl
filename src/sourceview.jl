@@ -1245,6 +1245,17 @@ function distrust_body!(d::Set{Tuple{Int,Int}}, node, callsites)
     return d
 end
 
+"`distrust_body!` on every subtree of `node` that lies within one of `ranges`."
+function distrust_within!(d::Set{Tuple{Int,Int}}, node, ranges, callsites)
+    fb, lb = first_byte(node), last_byte(node)
+    any(((a, b),) -> a <= fb && lb <= b, ranges) && return distrust_body!(d, node, callsites)
+    kids = children(node)
+    kids === nothing || for c in kids
+        distrust_within!(d, c, ranges, callsites)
+    end
+    return d
+end
+
 "Note for a body rendered without annotation because the code analysed was not
 the code shown. See `distrust_body!`."
 inlined_note(node::Node) =
@@ -1291,6 +1302,15 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
 
     callsite_map = Dict{Tuple{Int,Int},NamedTuple}()
     unplaced = Int[]
+    # Ranges the mapping handed a call that is not performed there. A `ccall`'s
+    # argument-type tuple `(Ref{UInt8}, Ref{BlasInt}, ...)` in BandedMatrices'
+    # `gbmv!` came back as the span of one of the `unsafe_convert`s the ccall
+    # lowers to, typed `Ptr{Int64}`. A tuple performs no call the source spells,
+    # so neither the click nor the type is its own -- nor its members': the one
+    # `Ref{UInt8}` spelled once on the line kept `::Core.Const(Ref{UInt8})` while
+    # every ambiguous `Ref{BlasInt}` lost its mapping, which reads as a claim.
+    distrust = Set{Tuple{Int,Int}}()
+    tuples = Any[]
     try
         callsites, sourcenodes = find_callsites(s.provider, result, node.ci, true)
         if length(kids) == length(callsites) == length(sourcenodes)
@@ -1307,6 +1327,11 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
                 kn = s.nodes[kids[i]]
                 is_name_resolution(kn) && continue
                 is_synthetic_construct(kn, kind(sn)) && continue
+                if kind(sn) === K"tuple"
+                    push!(tuples, sn)
+                    push!(unplaced, kids[i])
+                    continue
+                end
                 kind(sn) === K"macrocall" &&
                     (sn = something(enclosing_call_named(sn, kn.label.name, sourcefile(tsn)), sn))
                 key = (first_byte(sn), last_byte(sn))
@@ -1343,6 +1368,11 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
                 callsite_map[key] = (id = k, rt = l.rt,
                                      unstable = l.unstable, union = l.expected_union)
             end
+            # After placement, so a real call inside the tuple keeps its own. On
+            # the TYPED tree: the source node Cthulhu handed back is a plain
+            # `SyntaxNode` with no `typ` to read.
+            isempty(tuples) || distrust_within!(distrust, tsn,
+                [(first_byte(t), last_byte(t)) for t in tuples], callsite_map)
         end
     catch err
         # annotation is best-effort; the un-clickable source is still useful.
@@ -1411,7 +1441,7 @@ function source_html(s::Session, node::Node, cfg::CthulhuConfig;
 
     src = sourcefile(tsn)
     startb = first_byte(tsn)
-    unverified = collect_unverified!(Set{Tuple{Int,Int}}(), tsn, callsite_map, false)
+    unverified = collect_unverified!(distrust, tsn, callsite_map, false)
     inlined && distrust_body!(unverified, body, callsite_map)
     ctx = RenderCtx(src, callsite_map, deadspans, unverified,
                     collect_unowned!(unowned, tsn),

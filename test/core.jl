@@ -44,6 +44,14 @@ function macroline(cf::Coefs, bs, tol, r, fr)
     return 0.0
 end
 
+# A `ccall` lowers to a `cconvert`/`unsafe_convert` per argument, and the mapping
+# hands one of them to the argument-type tuple -- BandedMatrices' `gbmv!` showed
+# `::Ptr{Int64}` on `(Ref{UInt8}, Ref{BlasInt}, ...)`. A tuple performs no call.
+function ccalls(n::Int, x::Float64)
+    ccall(:jl_gc_safepoint, Nothing, (Ref{Int64}, Ref{Float64}), n, x)
+    x
+end
+
 # `a || return x` runs the return when `a` is false, `a && return x` when it is
 # true -- the shape of `crc isa NoSpace || return crc` in ApproxFunBase's
 # `union`, which was greyed as compiled out on the path it took.
@@ -1462,6 +1470,18 @@ end
     @test enclosing_call_named(mc, "maximum", JuliaSyntax.sourcefile(call)) === call
     @test enclosing_call_named(mc, "Base.maximum", JuliaSyntax.sourcefile(call)) === call
     @test enclosing_call_named(mc, "sum", JuliaSyntax.sourcefile(call)) === nothing
+end
+
+@testset "a ccall's type tuple is neither a call nor typed by one" begin
+    cfg = headless_config(CONFIG; view=:source)
+    s = Session(provider, find_method_instance(provider, ccalls, Tuple{Int,Float64}); config=cfg)
+    html = source_html(s, s.nodes[ROOT_ID], cfg)
+    m = match(r"<span class=\"([^\"]*)\"([^>]*)>\(<span[^>]*>Ref", html)
+    @test m === nothing || (!occursin("data-node-id", m.captures[2]) && !occursin("Ptr{", m.captures[2]))
+    @test !occursin(r"data-type=\"::Ptr\{[^\"]*\"[^>]*>\(", html)
+    # ...and nothing inside it is either: the one spelling the mapping kept
+    # would read as a claim next to the ones it dropped
+    @test !occursin("Core.Const(Ref{", html)
 end
 
 @testset "a short-circuit operand is skipped only after a value that skips it" begin
